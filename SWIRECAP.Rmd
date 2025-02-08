@@ -1,0 +1,196 @@
+---
+title: "SWIRE_CAPSTONE"
+author: "Imogen Holdsworth"
+date: "2025-01-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+pacman::p_load(pacman,dplyr,caret, tidyverse,ggplot2, readxl,maps,tidyr,readr)
+
+```
+
+## Customer Address and Zip Mapping:
+
+```{r}
+# Load the data
+AddressZip_OG <- read.csv("/Users/u0847758/Desktop/CAP/customer_address_and_zip_mapping.csv")
+```
+
+
+```{r}
+# Ensure AddressZip_OG is a data frame with the correct column structure
+# Assume the relevant column to split is named 'full_address'
+
+# Split the column
+AddressZip_Split <- AddressZip_OG |>
+  separate(full.address, into = c("ZIP", "City", "State Name", "State Short", 
+                                  "County","Code", "Latitude", "Longitude"), sep = ",")
+
+# View the result
+print(AddressZip_Split)
+
+AddressZip_Split[rowSums(is.na(AddressZip_Split)) > 0, ]
+
+# none missing
+
+```
+
+
+## Customer Profiles
+
+```{r}
+customer_profile<- read.csv("/Users/u0847758/Desktop/CAP/customer_profile.csv")
+```
+
+
+## Delivery Cost Data
+
+```{r}
+delivery_cost_data <- read_excel("/Users/u0847758/Desktop/CAP/delivery_cost_data (1).xlsx")
+```
+
+## Transactional 
+```{r}
+transactional_data<-  read.csv("/Users/u0847758/Desktop/CAP/transactional_data (1).csv")
+```
+
+```{r}
+
+# Transactional Data EDA
+colSums(is.na(transactional_data))
+  # no missing
+
+summary(transactional_data)
+
+#ordered cases has a super high 8479.89 max compared to a median7.00 of and a mean of26.85, ,loaded cases and delivered cases is similar. delivered cases has an odd negative min, same with delivered gallons
+
+ggplot(transactional_data, aes(y = ORDERED_CASES)) +
+  geom_boxplot() +
+  labs(title = "Boxplot of Ordered Cases", y = "Ordered Cases")
+
+ggplot(transactional_data, aes(x = ORDERED_CASES)) +
+  geom_density(fill = "purple", alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Density Plot of Ordered Cases", x = "Ordered Cases")
+
+transactional_data |>
+  arrange(desc(ORDERED_CASES)) |>
+  head(50)
+# 8479 isnt crazy i guess, may need to do some sort of transformations maybe log to normalize. but the third quartile is only 18.50 
+
+```
+
+
+
+```{r}
+colSums(is.na(customer_profile))
+
+  #PRIMARY_GROUP_NUMBER  missing 18196
+
+summary(customer_profile)
+
+
+# trade and cold drink cahnnel sub trade channel should maybe be factors, CO2 customer should be binary indicator, same with local market partner
+```
+
+```{r}
+colSums(is.na(delivery_cost_data))
+summary(delivery_cost_data)
+
+#Cold Drink Channel, Vol Range, Cost Type <- should maybe be factors (ordinal or categorial maybe?)
+
+
+```
+
+```{r}
+# IQR for outliers:
+
+Q1 <- quantile(transactional_data$ORDERED_CASES, 0.25, na.rm = TRUE)
+Q3 <- quantile(transactional_data$ORDERED_CASES, 0.75, na.rm = TRUE)
+IQR_value <- Q3 - Q1
+
+# Identify outliers
+outliers <- transactional_data|>
+  filter(ORDERED_CASES < (Q1 - 1.5 * IQR_value) | ORDERED_CASES > (Q3 + 1.5 * IQR_value))
+
+print(nrow(outliers))  # Count of outliers
+head(outliers)  # View some outliers
+```
+Summary Table:
+ 
+collapsing transaction data into one row per customer per year
+
+```{r}
+# New summary table
+
+customer_yearly_order_totals <- transactional_data |>
+  group_by(YEAR, CUSTOMER_NUMBER) |>
+  summarise(
+    ORDERED_CASES = sum(ORDERED_CASES),
+    DELIVERED_CASES = sum(DELIVERED_CASES),
+    ORDERED_GALLONS = sum(ORDERED_GALLONS),
+    DELIVERED_GALLONS = sum(DELIVERED_GALLONS)
+  ) |>
+  
+# indicator binary for if the customer has reached or overaged on the threshold set by Swire
+  
+  mutate(OVER_400_GALLONS = ifelse(ORDERED_GALLONS > 400, 1, 0))  # Binary indicator
+
+# View the first few rows
+head(customer_yearly_order_totals)
+```
+
+compare the groups where customers reached or over threshold vs those who did not
+
+```{r}
+customer_yearly_order_totals |>
+  group_by(OVER_400_GALLONS) |>
+  summarise(
+    AVG_ORDERED_CASES = mean(ORDERED_CASES),
+    AVG_DELIVERED_CASES = mean(DELIVERED_CASES),
+    AVG_ORDERED_GALLONS = mean(ORDERED_GALLONS),
+    AVG_DELIVERED_GALLONS = mean(DELIVERED_GALLONS),
+    COUNT_CUSTOMERS = n()  # Total customers in each group
+  )
+
+
+```
+
+median instead of mean?
+
+```{r}
+customer_yearly_order_totals |>
+  group_by(OVER_400_GALLONS) |>
+summarise(
+  MEDIAN_ORDERED_CASES = median(ORDERED_CASES)
+)
+
+ggplot(customer_yearly_order_totals, aes(x = as.factor(OVER_400_GALLONS), y = ORDERED_GALLONS)) +
+  geom_boxplot(fill = "blue") +
+  labs(title = "Distribution of Ordered Gallons by Customer Group")
+
+
+
+```
+^ this visualization is kind of worthless, but i cant decide what thresgold we shoudl set in regards to the outliers, 
+
+
+```{r}
+
+customer_yearly_order_totals|>
+  group_by(OVER_400_GALLONS) |>
+  summarise(AVG_ORDERED_GALLONS = mean(ORDERED_GALLONS, na.rm = TRUE)) |>
+  ggplot(aes(x = as.factor(OVER_400_GALLONS), y = AVG_ORDERED_GALLONS, fill = as.factor(OVER_400_GALLONS))) +
+  geom_col() +
+  labs(title = "Average Ordered Gallons by Customer Group", 
+       x = "Over 400 Gallons (0 = No, 1 = Yes)", 
+       y = "Average Ordered Gallons") +
+  scale_fill_manual(values = c("red", "blue"), name = "Over 400 Gallons") +
+  theme_minimal()
+
+
+```
+ordered vs delivers? 
