@@ -1,0 +1,1054 @@
+---
+title: "SWIRE_CAPSTONE_EDA"
+author: "Imogen Holdsworth"
+date: "2025-01-25"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+    toc_float: yes # makes the toc move along
+    code_folding: "show"  # Use "hide" to collapse code by default
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Introduction
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+pacman::p_load(pacman,dplyr,caret, tidyverse,ggplot2, readxl,maps,tidyr,readr,lubridate,viridis, RColorBrewer)
+
+```
+
+# Data Descriptions
+
+
+
+# Missing Data
+
+
+## Customer Address and Zip Mapping:
+
+```{r}
+# Load the data
+AddressZip_OG <- read.csv("/Users/u0847758/Desktop/CAP/customer_address_and_zip_mapping.csv")
+```
+
+
+```{r}
+# Ensure AddressZip_OG is a data frame with the correct column structure
+# Assume the relevant column to split is named 'full_address'
+
+# Split the column
+AddressZip_Split <- AddressZip_OG |>
+  separate(full.address, into = c("ZIP", "City", "State Name", "State Short", 
+                                  "County","Code", "Latitude", "Longitude"), sep = ",")
+
+# View the result
+print(AddressZip_Split)
+
+AddressZip_Split[rowSums(is.na(AddressZip_Split)) > 0, ]
+
+# none missing
+
+```
+
+
+## Customer Profiles
+
+```{r}
+customer_profile<- read.csv("/Users/u0847758/Desktop/CAP/customer_profile.csv")
+```
+
+
+## Delivery Cost Data
+
+```{r}
+delivery_cost_data <- read_excel("/Users/u0847758/Desktop/CAP/delivery_cost_data (1).xlsx")
+```
+
+## Transactional 
+```{r}
+transactional_data<-  read.csv("/Users/u0847758/Desktop/CAP/transactional_data (1).csv")
+```
+
+
+
+
+
+```{r}
+colSums(is.na(customer_profile))
+
+  #PRIMARY_GROUP_NUMBER  missing 18196
+
+summary(customer_profile)
+
+
+# trade and cold drink channel sub trade channel should maybe be factors, CO2 customer should be binary indicator, same with local market partner
+```
+
+```{r}
+colSums(is.na(delivery_cost_data))
+summary(delivery_cost_data)
+
+#Cold Drink Channel, Vol Range, Cost Type <- should maybe be factors (ordinal or categorial maybe?)
+
+
+```
+
+
+```{r}
+
+# Transactional Data EDA
+colSums(is.na(transactional_data))
+  # no missing
+
+summary(transactional_data)
+
+#ordered cases has a super high 8479.89 max compared to a median7.00 of and a mean of26.85, ,loaded cases and delivered cases is similar. delivered cases has an odd negative min, same with delivered gallons
+
+ggplot(transactional_data, aes(y = ORDERED_CASES)) +
+  geom_boxplot() +
+  labs(title = "Boxplot of Ordered Cases", y = "Ordered Cases")
+
+ggplot(transactional_data, aes(x = ORDERED_CASES)) +
+  geom_density(fill = "purple", alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Density Plot of Ordered Cases", x = "Ordered Cases")
+
+transactional_data |>
+  arrange(desc(ORDERED_CASES)) |>
+  head(100)
+  # 8479 isn't crazy i guess, may need to do some sort of transformations maybe log to normalize. but the third quartile is only 18.50 
+```
+
+
+```{r}
+# IQR for outliers:
+
+Q1 <- quantile(transactional_data$ORDERED_CASES, 0.25, na.rm = TRUE)
+Q3 <- quantile(transactional_data$ORDERED_CASES, 0.75, na.rm = TRUE)
+IQR_value <- Q3 - Q1
+
+# Identify outliers
+outliers <- transactional_data|>
+  filter(ORDERED_CASES < (Q1 - 1.5 * IQR_value) | ORDERED_CASES > (Q3 + 1.5 * IQR_value))
+
+print(nrow(outliers))  # Count of outliers
+head(outliers)  # View some outliers
+```
+Summary Table:
+ 
+collapsing transaction data into one row per customer per year
+
+```{r}
+# New summary table
+
+customer_yearly_order_totals <- transactional_data |>
+  group_by(YEAR, CUSTOMER_NUMBER) |>
+  summarise(
+    ORDERED_CASES = sum(ORDERED_CASES),
+    DELIVERED_CASES = sum(DELIVERED_CASES),
+    ORDERED_GALLONS = sum(ORDERED_GALLONS),
+    DELIVERED_GALLONS = sum(DELIVERED_GALLONS)
+  ) |>
+  
+# indicator binary for if the customer has reached or overaged on the threshold set by Swire
+  
+  mutate(OVER_400_GALLONS = ifelse(ORDERED_GALLONS > 400, 1, 0))  # Binary indicator
+
+# View the first few rows
+head(customer_yearly_order_totals)
+```
+
+compare the groups where customers reached or over threshold vs those who did not
+
+```{r}
+customer_yearly_order_totals |>
+  group_by(OVER_400_GALLONS) |>
+  summarise(
+    AVG_ORDERED_CASES = mean(ORDERED_CASES),
+    AVG_DELIVERED_CASES = mean(DELIVERED_CASES),
+    AVG_ORDERED_GALLONS = mean(ORDERED_GALLONS),
+    AVG_DELIVERED_GALLONS = mean(DELIVERED_GALLONS),
+    COUNT_CUSTOMERS = n()  # Total customers in each group
+  )
+
+
+```
+
+median instead of mean?
+
+```{r}
+customer_yearly_order_totals |>
+  group_by(OVER_400_GALLONS) |>
+summarise(
+  MEDIAN_ORDERED_CASES = median(ORDERED_CASES)
+)
+
+ggplot(customer_yearly_order_totals, aes(x = as.factor(OVER_400_GALLONS), y = ORDERED_GALLONS)) +
+  geom_boxplot(fill = "blue") +
+  labs(title = "Distribution of Ordered Gallons by Customer Group")
+
+```
+^ this visualization is kind of worthless, but i cant decide what thresgold we shoudl set in regards to the outliers, 
+
+
+```{r}
+
+customer_yearly_order_totals|>
+  group_by(OVER_400_GALLONS) |>
+  summarise(AVG_ORDERED_GALLONS = mean(ORDERED_GALLONS, na.rm = TRUE)) |>
+  ggplot(aes(x = as.factor(OVER_400_GALLONS), y = AVG_ORDERED_GALLONS, fill = as.factor(OVER_400_GALLONS))) +
+  geom_col() +
+  labs(title = "Average Ordered Gallons by Customer Group", 
+       x = "Over 400 Gallons (0 = No, 1 = Yes)", 
+       y = "Average Ordered Gallons") +
+  scale_fill_manual(values = c("red", "blue"), name = "Over 400 Gallons") +
+  theme_minimal()
+
+
+```
+ordered vs delivers? 
+
+
+```{r}
+
+customer_yearly_order_totals |>
+  group_by(OVER_400_GALLONS) |>
+  summarise(
+    AVG_ORDERED_GALLONS = mean(ORDERED_GALLONS, na.rm = TRUE),
+    AVG_DELIVERED_GALLONS = mean(DELIVERED_GALLONS, na.rm = TRUE)
+  ) |>
+  pivot_longer(cols = c(AVG_ORDERED_GALLONS, AVG_DELIVERED_GALLONS), 
+               names_to = "Gallons_Type", values_to = "Gallons_Value") |>
+  ggplot(aes(x = as.factor(OVER_400_GALLONS), y = Gallons_Value, fill = Gallons_Type)) +
+  geom_bar(stat = "identity", position = "dodge") +  # dodge = side by side
+  labs(title = "Ordered vs. Delivered Gallons (Side-by-Side)",
+       x = "Over 400 Gallons (0 = No, 1 = Yes)",
+       y = "Average Gallons",
+       fill = "Gallons Type") +
+  scale_fill_manual(values = c("blue", "red")) +
+  theme_minimal()
+
+```
+```{r}
+ggplot(customer_yearly_order_totals, aes(x = ORDERED_GALLONS, fill = as.factor(OVER_400_GALLONS))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot: Ordered Gallons by Customer Group",
+       x = "Ordered Gallons",
+       fill = "Over 400 Gallons") +
+  scale_fill_manual(values = c("red", "blue")) +
+  theme_minimal()
+
+```
+
+Customer growth patterns in the transactional data:
+ Key Questions:
+Which customers are growing?
+What is the year-over-year growth rate per customer?
+Do certain ordering patterns indicate future growth?
+Are customers consistently ordering more each year?
+ 
+ 
+## Growth rate per cusomter?
+```{r}
+customer_growth <- transactional_data|>
+  group_by(CUSTOMER_NUMBER, YEAR) |>
+  summarise(TOTAL_ORDERED_GALLONS = sum(ORDERED_GALLONS, na.rm = TRUE)) |>
+  arrange(CUSTOMER_NUMBER, YEAR) |>
+  mutate(YOY_GROWTH = (TOTAL_ORDERED_GALLONS - lag(TOTAL_ORDERED_GALLONS)) / lag(TOTAL_ORDERED_GALLONS))
+
+head(customer_growth)
+
+```
+lag shifts values down by one row within each customer group.- grabs the previous year's ordered gallons for each customer.
+ 
+ ordering patterns over year:
+  which customers might start small and grow, while others have sporadic large orders.
+
+```{r}
+
+ggplot(customer_growth, aes(x = YEAR, y = TOTAL_ORDERED_GALLONS, group = CUSTOMER_NUMBER)) +
+  geom_line(alpha = 0.3) +
+  theme_minimal() +
+  labs(title = "Customer Growth Trends Over Time",
+       x = "Year", y = "Ordered Gallons")
+
+```
+
+^^ again, i think some of this would be more insightful once we decide where to cut off outliers for the project, i mean if we kind of care mosslty about custoemrs who were below threshold then were not maybe we can just segment the data down to that for the visual EDA?
+ 
+```{r}
+summary(customer_yearly_order_totals)
+```
+
+ create a new table that:
+
+Groups data by year and customer
+Checks if the customer met the 400-gallon threshold in one year (THRESHOLD_YEAR_1)
+Checks if they met it again in the next year (THRESHOLD_YEAR_2)
+
+```{r}
+# new table
+customer_threshold_tracking <- transactional_data |>
+  group_by(YEAR, CUSTOMER_NUMBER) |>
+  summarise(
+    ORDERED_CASES = sum(ORDERED_CASES),
+    DELIVERED_CASES = sum(DELIVERED_CASES),
+    ORDERED_GALLONS = sum(ORDERED_GALLONS),
+    DELIVERED_GALLONS = sum(DELIVERED_GALLONS)
+  ) |>
+  arrange(CUSTOMER_NUMBER, YEAR) |>  
+  mutate(
+    THRESHOLD_YEAR_1 = ifelse(ORDERED_GALLONS >= 400, 1, 0),
+    THRESHOLD_YEAR_2 = lag(THRESHOLD_YEAR_1)  #  last year's threshold status
+  )
+
+# View first few rows
+head(customer_threshold_tracking)
+
+```
+Track if customers cross the 400-gallon threshold from one year to the next.
+compare changes over time to identify customers who are steadily growing.
+Find customers who jump past 400 gallons but later fall back below the threshold.
+ 
+ > dealing with the NA for year two threshold indicator'
+ > I need to figute out which cusomtes are missing data for 2023 or 2024- do we consider dropping them? or 
+ 
+
+ 
+```{r}
+full_profile_data <- transactional_data |>
+  left_join(customer_profile, by = "CUSTOMER_NUMBER") |>  # Join by Customer Number
+  mutate(GROUPING_KEY = coalesce(as.character(PRIMARY_GROUP_NUMBER), as.character(CUSTOMER_NUMBER)))  # Use Primary Group if available, else Customer Number
+
+# View first few rows
+head(full_profile_data)
+```
+ 
+ 
+ 
+ grouping key will be primary group number if exists, or the customer number if they do not belong to a primary group number
+ 
+ 
+ adding indicator for if the row is part of an outlet (has a primary group number)
+ 
+ primary gorup number: A unique identifier for each retailer. Multiple customer_numbers (outlets) belonging to the same primary_group (retailer) indicate they are part of a chain.
+ 
+```{r}
+full_profile_data <- full_profile_data |>
+  mutate(
+    Part_of_an_Outlet = ifelse(!is.na(PRIMARY_GROUP_NUMBER), 'Yes', 'No')  # 1 if Primary Group exists, 0 otherwise
+  )
+
+# View first few rows
+head(full_profile_data)
+```
+ 
+```{r}
+# Export the dataframe to a CSV file
+write.csv(full_profile_data, "full_profile_data.csv", row.names = FALSE)
+
+```
+ 
+ 
+ 
+ 
+ okay now i want to look at how rows that part of an outlet perfrom compared to ones that are not part of an outlet in terms of total order in a year: here is some context, the data table has customer orders by row, where one row will contain the customer number, primary key if it exists and the ordered cases and ordered gallons, now a customer may order many times in the year, so there amy be many transaction dates that corespond with the customer number. What i need to do is add the ordered cases and ordered gallons to create total order (cases and gallons are one to one so no conversaion needed) then I need to group every instance of the customer id in that year to make sure i am getting a reflection of the year total of the order for that customer, then i want to do a seperate table to look at the customers by thier primary grup if they have one, so i want to take only the customer with primary groups then i want to collapse customers into thier primary group number then look at the total order in 2023 and then 2024, and then maybe also do some anaylsis with the weeks to look at customer order trends over the year
+ 
+ 
+ 
+ 
+ 
+ Each row in your dataset represents an individual transaction, so we need to sum all orders (cases + gallons) per customer for each year.
+ 
+ 
+```{r}
+# Add order total by customer (cases + gallons)
+full_profile_data <- full_profile_data |>
+  mutate(order_total = ORDERED_CASES + ORDERED_GALLONS)
+
+# Summarize total orders per customer per year
+customer_yearly_totals <- full_profile_data |>
+  group_by(YEAR, CUSTOMER_NUMBER) |>
+  summarise(total_order = sum(order_total), .groups = "drop") # remove the grouping after summarization
+
+# View result
+head(customer_yearly_totals)
+
+```
+ 
+ Now you have total orders for each customer per year!
+ 
+ 
+ 
+ 
+ 
+ 
+  Summarize Data at the Primary Group Level
+Since some customers belong to a Primary Group, we need to aggregate data at the Primary Group level, grouping all customers within the same Primary Group Number.
+ 
+ Since some customers belong to a Primary Group, we need to aggregate data at the Primary Group level, grouping all customers within the same Primary Group Number.
+ 
+```{r}
+
+summary(full_profile_data$PRIMARY_GROUP_NUMBER)
+
+count(full_profile_data)
+1045540 - 490895 # 554645 rows that have primary group numbers
+
+
+# Filter only customers with a Primary Group Number
+outlet_customers <- full_profile_data |>
+  filter(!is.na(PRIMARY_GROUP_NUMBER))
+
+count(outlet_customers) # 554645 looks good
+
+# Summarize orders at the PRIMARY_GROUP_NUMBER level for each year
+outlet_customers <- outlet_customers |>
+  group_by(YEAR, PRIMARY_GROUP_NUMBER) |>
+  summarise(total_order = sum(order_total), .groups = "drop")
+
+# View result
+head(outlet_customers)
+
+summary(outlet_customers)
+
+```
+ ✅ Now each Primary Group has its total yearly order volume!
+ 
+ 
+Compare Customers with & Without Primary Groups
+This will help us understand if outlet customers (grouped customers) order differently than standalone customers.
+
+
+```{r}
+customer_group_analysis <- full_profile_data |>
+  mutate(ORDER_TOTAL = ORDERED_CASES + ORDERED_GALLONS) %>%  # Ensure order total is correctly calculated
+  mutate(HAS_PRIMARY_GROUP = ifelse(is.na(PRIMARY_GROUP_NUMBER), "No", "Yes")) |>
+  group_by(YEAR, CUSTOMER_NUMBER, HAS_PRIMARY_GROUP) |>
+  summarise(TOTAL_YEARLY_ORDER = sum(ORDER_TOTAL), .groups = "drop") %>%  # Sum orders per customer per year
+  group_by(YEAR, HAS_PRIMARY_GROUP) |>
+  summarise(AVG_TOTAL_ORDER = mean(TOTAL_YEARLY_ORDER), .groups = "drop")  # Now take the mean
+
+# View result
+print(customer_group_analysis)
+
+```
+
+
+
+
+
+```{r}
+ggplot(customer_group_analysis, aes(x = as.factor(YEAR), y = AVG_TOTAL_ORDER, fill = HAS_PRIMARY_GROUP)) +
+  geom_bar(stat = "identity", position = "dodge") +  
+  theme_minimal() +
+  labs(title = "Average Total Order by Grouping Status",
+       x = "Year",
+       y = "Average Total Order",
+       fill = "Primary Group Status") +
+  scale_fill_brewer(palette = "Set2")
+
+```
+
+Customers who are a part of a primary group have on average higher order totals
+
+
+
+Weekly order trends
+
+```{r}
+
+# Summarize total orders per week using existing YEAR and WEEK columns
+weekly_order_trends <- full_profile_data |>
+  mutate(order_total = ORDERED_CASES + ORDERED_GALLONS) |>
+  group_by(YEAR, WEEK) |>
+  summarise(total_order = sum(order_total),.groups = "drop")
+
+# View result
+head(weekly_order_trends)
+
+
+```
+
+
+```{r}
+ggplot(weekly_order_trends, aes(x = WEEK, y = total_order, fill = as.factor(YEAR))) +
+  geom_bar(stat = "identity", position = "dodge") +  
+  theme_minimal() +
+  labs(title = "Total Orders Month Over Month 2023 vs 2024",
+       x = "Week",
+       y = "Total Orders",
+       fill = "Year") +
+  scale_x_discrete(labels = month.abb)+
+  scale_fill_brewer(palette = "Set1")
+
+  # Convert numeric months to abbreviated names
+
+```
+
+
+
+
+```{r}
+
+weekly_order_trends <- full_profile_data |>
+  mutate(order_total = ORDERED_CASES + ORDERED_GALLONS) |>
+  group_by(YEAR, WEEK, GROUPING_KEY) |>
+  summarise(total_order = sum(order_total),.groups = "drop")
+
+# View result
+head(weekly_order_trends)
+```
+
+
+```{r}
+ggplot(weekly_order_trends, aes(x = WEEK, y = total_order, color = as.factor(GROUPING_KEY), group = GROUPING_KEY)) +
+  geom_line() +
+  theme_minimal() +
+  labs(title = "Weekly Order Trends by Grouping Key",
+       x = "Week Number",
+       y = "Total Orders",
+       color = "Grouping Key") +
+  scale_x_continuous(breaks = seq(1, 52, by = 4)) +  # Adjust X-axis to show every 4 weeks
+  theme(legend.position = "none")  # Hide legend if too many group keys
+
+```
+
+
+Customer distribution of threshold status 
+```{r}
+
+full_profile_data <- full_profile_data |>
+  mutate(order_total = ORDERED_GALLONS + ORDERED_CASES)
+
+customer_gallons_yearly <- full_profile_data |>
+  group_by(YEAR, CUSTOMER_NUMBER) |>
+  summarise(TOTAL_GALLONS = sum(order_total), .groups = "drop")
+
+
+# Add a binary flag for the 400-gallon threshold
+customer_gallons_yearly <- customer_gallons_yearly |>
+  mutate(ABOVE_400 = ifelse(TOTAL_GALLONS >= 400, "Above threshold", "Below threshold"))
+
+# Count customers above/below threshold per year
+threshold_counts <- customer_gallons_yearly |>
+  group_by(YEAR, ABOVE_400) |>
+  summarise(COUNT = n(), .groups = "drop")
+
+# Bar chart of customers above/below threshold
+ggplot(threshold_counts, aes(x = as.factor(YEAR), y = COUNT, fill = ABOVE_400)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Count of Customers Above/Below Threshold (400 Gallons Per Year)",
+       x = "Year",
+       y = "Customer Count",
+       fill = "Threshold Status")
+
+
+threshold_counts
+```
+
+
+```{r}
+# Ensure ORDER_TOTAL_GALLONS is correctly calculated
+full_profile_data <- full_profile_data %>%
+  mutate(ORDER_TOTAL_GALLONS = ORDERED_CASES + ORDERED_GALLONS)  # Cases & gallons are 1:1
+
+# Aggregate yearly total gallons per customer
+customer_gallons_yearly <- full_profile_data %>%
+  group_by(YEAR, CUSTOMER_NUMBER) %>%
+  summarise(TOTAL_GALLONS = sum(ORDER_TOTAL_GALLONS), .groups = "drop")
+
+
+# Join the primary group info to determine outlet status
+customer_gallons_yearly <- customer_gallons_yearly %>%
+  left_join(full_profile_data %>% select(CUSTOMER_NUMBER, PRIMARY_GROUP_NUMBER) %>% distinct(), by = "CUSTOMER_NUMBER") %>%
+  mutate(OUTLET_STATUS = ifelse(is.na(PRIMARY_GROUP_NUMBER), "Not in Outlet", "In Outlet"))
+
+# Add threshold indicator
+customer_gallons_yearly <- customer_gallons_yearly %>%
+  mutate(ABOVE_400 = ifelse(TOTAL_GALLONS >= 400, "Above 400", "Below 400"))
+
+# Count customers per category per year
+threshold_counts_outlet <- customer_gallons_yearly %>%
+  group_by(YEAR, OUTLET_STATUS, ABOVE_400) %>%
+  summarise(COUNT = n(), .groups = "drop")
+
+
+
+
+```
+ 
+ 
+ 
+ 
+```{r}
+ggplot(threshold_counts_outlet, aes(x = as.factor(YEAR), y = COUNT, fill = ABOVE_400)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ OUTLET_STATUS) +  # Separate by In Outlet vs. Not in Outlet
+  theme_minimal() +
+  labs(title = "Customers Above/Below 400 Gallons Per Year (Outlet vs. Non-Outlet)",
+       x = "Year",
+       y = "Customer Count",
+       fill = "Order Amount") +
+  scale_fill_brewer(palette = "Set2")
+
+
+```
+ 
+ 
+ 
+## First Delivery Date Analysis
+ 
+ 
+```{r}
+
+str(full_profile_data) # first delivery date is a character so move it to date format 
+
+head(full_profile_data$FIRST_DELIVERY_DATE)
+
+
+full_profile_data <- full_profile_data |>
+  mutate(FIRST_DELIVERY_DATE = as.Date(FIRST_DELIVERY_DATE, format="%m/%d/%Y"))
+
+# Check if conversion worked
+str(full_profile_data$FIRST_DELIVERY_DATE)
+summary(full_profile_data$FIRST_DELIVERY_DATE)
+
+
+```
+ 
+indicator for which year the customers first order was in. 
+ 
+```{r}
+
+first_order_analysis <- full_profile_data |>
+  mutate(FIRST_ORDER_YEAR = format(FIRST_DELIVERY_DATE, "%Y"),
+         FIRST_ORDER_2023_2024 = ifelse(FIRST_ORDER_YEAR %in% c("2023", "2024"), 1, 0))
+
+# Check counts
+table(first_order_analysis$FIRST_ORDER_2023_2024)
+
+ggplot(first_order_analysis, aes(x = as.factor(FIRST_ORDER_2023_2024), fill = as.factor(FIRST_ORDER_2023_2024))) +
+  geom_bar() +
+  theme_minimal() +
+  labs(title = "Number of Customers with First Order in 2023/2024",
+       x = "First Order in 2023/2024 (0 = No, 1 = Yes)",
+       y = "Customer Count",
+       fill = "First Order Indicator") +
+  scale_fill_manual(values = c("0" = "gray", "1" = "blue"))
+
+
+# Count number of customers by first order year
+customer_signup_counts <- first_order_analysis |>
+  count(FIRST_ORDER_YEAR)
+
+# Bar Chart
+ggplot(customer_signup_counts, aes(x = FIRST_ORDER_YEAR, y = n, fill = FIRST_ORDER_YEAR)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Number of Customers Who Signed Up Each Year",
+       x = "Year of First Order",
+       y = "Number of Customers",
+       fill = "Sign-Up Year") +
+  scale_fill_viridis_d(option = "plasma") +  # Use color gradient for better visualization
+  scale_x_discrete(limits = sort(unique(customer_signup_counts$FIRST_ORDER_YEAR)))  # Ensure years are sorted
+
+
+
+```
+
+ 
+### Aggregating order totals and add 400 gallon indicators 
+ 
+ each line in the data set is a transaction not a unique customer 
+ 
+ Since each row in full_profile_data represents a transaction, we need to:
+
+Aggregate total orders per customer per year
+Create separate columns for ORDER_TOTAL_2023 and ORDER_TOTAL_2024
+Add indicators for customers who ordered more than 400 gallons in each year
+Drop unnecessary columns (ORDER_TOTAL and ORDER_TOTAL_GALLONS)
+
+```{r}
+
+# Aggregate total orders per customer per year
+yearly_totals <- full_profile_data %>%
+  mutate(ORDER_TOTAL_GALLONS = ORDERED_CASES + ORDERED_GALLONS) %>%  # Ensure total orders are summed
+  group_by(YEAR, CUSTOMER_NUMBER) %>%
+  summarise(TOTAL_ORDERED_GALLONS = sum(ORDER_TOTAL_GALLONS), .groups = "drop")  # Collapse by year/customer
+
+
+```
+
+Now, each row represents a unique CUSTOMER_NUMBER and YEAR combination.
+
+
+
+
+We spread TOTAL_ORDERED_GALLONS across two separate columns (ORDER_TOTAL_2023 and ORDER_TOTAL_2024).
+```{r}
+
+yearly_totals_wide <- yearly_totals %>%
+  pivot_wider(names_from = YEAR, values_from = TOTAL_ORDERED_GALLONS, names_prefix = "ORDER_TOTAL_")
+
+# View result
+head(yearly_totals_wide)
+
+```
+
+```{r}
+yearly_totals_wide <- yearly_totals_wide %>%
+  mutate(
+    ABOVE_400_2023 = ifelse(ORDER_TOTAL_2023 >= 400, 1, 0),
+    ABOVE_400_2024 = ifelse(ORDER_TOTAL_2024 >= 400, 1, 0)
+  )
+
+# View result
+head(yearly_totals_wide)
+
+```
+
+```{r}
+head(full_profile_data)
+full_profile_data <- full_profile_data |>
+  select(-c(order_total,ORDER_TOTAL_GALLONS ))
+
+full_profile_data_cleaned <- full_profile_data |>
+  left_join(yearly_totals_wide, by = "CUSTOMER_NUMBER")
+
+# View result
+head(full_profile_data_cleaned)
+
+str(full_profile_data_cleaned)
+
+# add in the first delivery year: 
+full_profile_data_cleaned <- full_profile_data_cleaned |>
+  mutate(FIRST_DELIVERY_DATE = as.Date(FIRST_DELIVERY_DATE, format="%m/%d/%Y"))
+
+full_profile_data_cleaned <- full_profile_data_cleaned |>
+  mutate(FIRST_DELIVERY_YEAR = format(FIRST_DELIVERY_DATE, "%Y"))
+
+         
+full_profile_data_cleaned <- full_profile_data_cleaned |>
+  mutate(OUTLET_STATUS = ifelse(is.na(PRIMARY_GROUP_NUMBER), "Not in Outlet", "In Outlet"))
+
+
+head(full_profile_data_cleaned)
+
+table(full_profile_data_cleaned$OUTLET_STATUS)
+
+table(full_profile_data_cleaned$FIRST_DELIVERY_YEAR)
+
+
+
+
+
+```
+ so now the 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ so one customer can ahve multiple lines in the table as there are a row for each transaction, which could be an order delivery or a load, the customer may also use various order types for each of the transactions, each transaction has a date, a week a year 
+ 
+```{r}
+
+# Summarize yearly totals for each customer
+yearly_totals_extended <- full_profile_data_cleaned |>
+  mutate(
+    ORDERED_TOTAL_GALLONS = ORDERED_GALLONS + ORDERED_CASES,
+    LOADED_TOTAL_GALLONS = LOADED_GALLONS + LOADED_CASES,
+    DELIVERED_TOTAL_GALLONS = DELIVERED_GALLONS + DELIVERED_CASES) |>
+  group_by(YEAR, CUSTOMER_NUMBER) |>
+  summarise(
+    TOTAL_ORDERED_GALLONS = sum(ORDERED_TOTAL_GALLONS),
+    TOTAL_LOADED_GALLONS = sum(LOADED_TOTAL_GALLONS),
+    TOTAL_DELIVERED_GALLONS = sum(DELIVERED_TOTAL_GALLONS), .groups = "drop" ) |>
+  pivot_wider(names_from = YEAR, values_from = c(TOTAL_ORDERED_GALLONS, TOTAL_LOADED_GALLONS, TOTAL_DELIVERED_GALLONS), 
+              names_prefix = "")  # Ensure columns have clear names
+
+
+```
+Now, the dataset has columns like 2023_TOTAL_ORDERED_GALLONS, 2024_TOTAL_LOADED_GALLONS, 
+ 
+ Now, we will remove columns related to individual transactions and keep only one row per CUSTOMER_NUMBER
+```{r}
+# Join summarized totals back to full_profile_data_cleaned
+full_profile_data_final <- full_profile_data_cleaned |>
+  select(-c(TRANSACTION_DATE, WEEK, YEAR, ORDERED_CASES, LOADED_CASES, DELIVERED_CASES, ORDERED_GALLONS, LOADED_GALLONS, DELIVERED_GALLONS, ORDER_TYPE)) |>
+  distinct() |>
+  left_join(yearly_totals_extended, by = "CUSTOMER_NUMBER")
+
+head(full_profile_data_final)
+
+```
+ 
+ Exploring Customer Order Growth & Changes (2023 vs. 2024)
+ Now that each customer has one row in full_profile_data_final, we will analyze:
+ Customers who moved from below 400 → above 400 gallons
+ Year-over-year (YOY) change in total ordered/delivered gallons
+ Outlet vs. Non-Outlet growth differences
+ Visualizing these changes
+ 
+```{r}
+Clean_Profile_Full<- full_profile_data_final
+Clean_Profile_Full <- Clean_Profile_Full |>
+  mutate(
+    MOVED_ABOVE_400 = ifelse(ABOVE_400_2023 == 0 & ABOVE_400_2024 == 1, 1, 0)
+  )
+
+# Count how many customers moved above 400 gallons
+table(Clean_Profile_Full$MOVED_ABOVE_400)
+
+```
+ 
+ 21957 customers did move up to pass the threshold 
+ 
+ 
+Year over Year growth
+
+```{r}
+Clean_Profile_Full <- Clean_Profile_Full |>
+  mutate(
+    YOY_ORDER_GROWTH = (`TOTAL_ORDERED_GALLONS_2024` - `TOTAL_ORDERED_GALLONS_2023`) / `TOTAL_ORDERED_GALLONS_2023`,
+    YOY_DELIVERED_GROWTH = (`TOTAL_DELIVERED_GALLONS_2024` - `TOTAL_DELIVERED_GALLONS_2023`) / `TOTAL_DELIVERED_GALLONS_2023`)
+
+# View summary of YOY growth
+summary(Clean_Profile_Full$YOY_ORDER_GROWTH)
+
+# dealing with the NAs for Year over Y growth? 
+
+summary(Clean_Profile_Full$YOY_DELIVERED_GROWTH)
+
+head(Clean_Profile_Full$YOY_ORDER_GROWTH)
+
+
+```
+ 
+ i need to check if my order total is by outlet, because i think i want to keep it by customer bc how do i get customers that have 0 ordered cases but they do have delivered cases?
+ 
+ Inf will come from the fact that orders in 2023 were zero:
+ The issue occurs when a customer had no orders in 2023 (0) but had orders in 2024. The formula:
+
+Dividing by zero results in Inf
+ 
+ 
+ outlet vs non outlet growths 
+ 
+```{r}
+outlet_growth_comparison <- Clean_Profile_Full |>
+  group_by(OUTLET_STATUS) %>%
+  summarise(
+    AVG_YOY_ORDER_GROWTH = mean(YOY_ORDER_GROWTH),
+    AVG_YOY_DELIVERED_GROWTH = mean(YOY_DELIVERED_GROWTH),
+    TOTAL_MOVED_ABOVE_400 = sum(MOVED_ABOVE_400),
+    .groups = "drop"
+  )
+
+print(outlet_growth_comparison)
+
+```
+ 
+ 
+ 
+```{r}
+# Filter rows where either 2023 or 2024 total ordered gallons is NA
+na_ordered_gallons <- Clean_Profile_Full |>
+  filter(is.na(`TOTAL_ORDERED_GALLONS_2023`) | is.na(`TOTAL_ORDERED_GALLONS_2024`))
+
+# View the results
+print(na_ordered_gallons)
+
+# what should we do for those whoe had a first delivery year in 2024 and did not have orders in 2023, set to 0? or there are customers who look like they did not make an order in 2024, 
+
+```
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+  Step 1: Adjust YOY Growth Calculation
+Instead of dividing by zero, we classify customers who had no orders in 2023 as having 100% growth (or "New Customer").
+
+r
+Copy
+Edit
+full_profile_data_final <- full_profile_data_final %>%
+  mutate(
+    YOY_ORDER_GROWTH = case_when(
+      `2023_TOTAL_ORDERED_GALLONS` == 0 & `2024_TOTAL_ORDERED_GALLONS` > 0 ~ 1,  # Set to 100% growth for new customers
+      `2023_TOTAL_ORDERED_GALLONS` > 0 ~ (`2024_TOTAL_ORDERED_GALLONS` - `2023_TOTAL_ORDERED_GALLONS`) / `2023_TOTAL_ORDERED_GALLONS`,  # Regular growth formula
+      TRUE ~ NA_real_  # Handle missing cases
+    ),
+    
+    YOY_DELIVERED_GROWTH = case_when(
+      `2023_TOTAL_DELIVERED_GALLONS` == 0 & `2024_TOTAL_DELIVERED_GALLONS` > 0 ~ 1,  # Set to 100% growth for new customers
+      `2023_TOTAL_DELIVERED_GALLONS` > 0 ~ (`2024_TOTAL_DELIVERED_GALLONS` - `2023_TOTAL_DELIVERED_GALLONS`) / `2023_TOTAL_DELIVERED_GALLONS`,
+      TRUE ~ NA_real_
+    )
+  )
+✅ This ensures:
+
+Customers who had no orders in 2023 but did in 2024 show as 100% growth (1) instead of Inf.
+Other customers still have a proper YOY growth percentage.
+NA values remain where there's no valid data.
+🚀 Step 2: Verify the Results
+r
+Copy
+Edit
+summary(full_profile_data_final$YOY_ORDER_GROWTH)
+summary(full_profile_data_final$YOY_DELIVERED_GROWTH)
+
+# Check customers who had 100% growth (New Customers)
+full_profile_data_final %>%
+  filter(YOY_ORDER_GROWTH == 1) %>%
+  select(CUSTOMER_NUMBER, `2023_TOTAL_ORDERED_GALLONS`, `2024_TOTAL_ORDERED_GALLONS`, YOY_ORDER_GROWTH)
+✅ This ensures that new customers are properly accounted for in growth analysis.
+
+🚀 Step 3: Update Visualizations to Show New Customers
+We now split "New Customers" from other growth categories.
+
+1️⃣ Bar Chart: Growth Categories
+r
+Copy
+Edit
+full_profile_data_final <- full_profile_data_final %>%
+  mutate(GROWTH_CATEGORY = case_when(
+    YOY_ORDER_GROWTH == 1 ~ "New Customer",
+    YOY_ORDER_GROWTH > 0 ~ "Positive Growth",
+    YOY_ORDER_GROWTH < 0 ~ "Decline",
+    TRUE ~ "No Change"
+  ))
+
+# Count customers by growth category
+growth_category_counts <- full_profile_data_final %>%
+  count(GROWTH_CATEGORY)
+
+# Plot
+ggplot(growth_category_counts, aes(x = GROWTH_CATEGORY, y = n, fill = GROWTH_CATEGORY)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Year-over-Year Growth Categories (2023-2024)",
+       x = "Growth Category",
+       y = "Number of Customers",
+       fill = "Growth Category") +
+  scale_fill_manual(values = c("New Customer" = "blue", "Positive Growth" = "green", "Decline" = "red", "No Change" = "gray"))
+✅ This shows how many customers are:
+
+New customers
+Growing customers
+Declining customers
+No change customers
+🚀 Step 4: Compare New Customers to Others
+If you want to compare new customers against retained customers:
+
+r
+Copy
+Edit
+new_vs_existing <- full_profile_data_final %>%
+  mutate(IS_NEW_CUSTOMER = ifelse(YOY_ORDER_GROWTH == 1, "New Customer", "Existing Customer")) %>%
+  group_by(IS_NEW_CUSTOMER) %>%
+  summarise(
+    AVG_ORDERED_2024 = mean(`2024_TOTAL_ORDERED_GALLONS`, na.rm = TRUE),
+    MEDIAN_ORDERED_2024 = median(`2024_TOTAL_ORDERED_GALLONS`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(new_vs_existing)
+✅ This compares how much new customers ordered in 2024 vs. existing customers.
+
+🚀 Summary of Fixes
+✔ Fixed Inf issue in YOY growth calculation by setting new customers to 100% growth
+✔ Ensured regular customers still have valid growth values
+✔ Created a growth category (New Customer, Growth, Decline, No Change)
+✔ Visualized the different growth categories
+✔ Compared new customers against existing ones
+
+
+ 
+ 
+ 
+ 
+ 
+ 
+ i would also like to look at the customers who had more than 400 gallons ordered and had first delivery date in 2023 or 2024
+ 
+ 
+ 
+ 
+## CO2 customer analysis
+ 
+ 
+ Also i need to investigate CO2 customers 
+Now, we will analyze CO₂ customers to understand:
+1️⃣ Total number of CO₂ vs. Non-CO₂ customers
+2️⃣ How much CO₂ customers order compared to Non-CO₂
+3️⃣ How many CO₂ customers belong to an outlet vs. independent
+4️⃣ Year-over-year growth of CO₂ customer orders
+5️⃣ CO₂ customers above/below 400-gallon threshold
+6️⃣ Visualizations to compare trends
+
+
+```{r}
+# Count CO₂ and Non-CO₂ customers
+Clean_Profile_Full |>
+  count(CO2_CUSTOMER)
+
+# Summarize total orders for CO₂ vs. Non-CO₂ customers
+co2_order_summary <- Clean_Profile_Full |>
+  group_by(CO2_CUSTOMER) |>
+  summarise(
+    AVG_ORDERED_2023 = mean(`ORDER_TOTAL_2023`),
+    AVG_ORDERED_2024 = mean(`ORDER_TOTAL_2024`),
+    MEDIAN_ORDERED_2023 = median(`ORDER_TOTAL_2023`),
+    MEDIAN_ORDERED_2024 = median(`ORDER_TOTAL_2024`), .groups = "drop"
+    )
+print(co2_order_summary)
+
+summary(Clean_Profile_Full$TOTAL_ORDERED_GALLONS_2023)
+
+str(Clean_Profile_Full)
+
+```
+
+ Co2 customers outlet vs not:
+ 
+ # Count CO₂ customers by Outlet status
+co2_outlet_distribution <- full_profile_data_final %>%
+  group_by(IS_CO2_CUSTOMER, OUTLET_STATUS) %>%
+  summarise(COUNT = n(), .groups = "drop")
+
+print(co2_outlet_distribution)
+
+ 
+ 
+ 
+ 
+ >> we need to deal with the NA in orderd gallons in 2023 and 2024 
+ 
+ 
+ 
+ 
+
+
+resources:
+https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/ 
+
+ 
