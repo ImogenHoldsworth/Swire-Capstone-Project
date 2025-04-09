@@ -1,0 +1,2026 @@
+---
+title: "Imogen MLM Retailers"
+author: "Imogen Holdsworth"
+date: "2025-03-29"
+output: html_document
+---
+
+```{r}
+pacman::p_load(tidyverse, scales, dplyr, corrr, janitor, tidyr, psych, readr, lubridate, rpart, rpart.plot, caret, C50, sf, maps, dbscan, geosphere, nnet, randomForest,readxl,Metrics,pROC,lme4,purrr, tibble, yardstick, performance, lmerTest) 
+```
+
+# Data Load for MLM
+```{r}
+CustomerProfileData <- read.csv("/Users/u0847758/Desktop/CAP/customer_profile.csv")  
+TransactionalData <- read.csv("/Users/u0847758/Desktop/CAP/transactional_data (1).csv")
+AddressZipData <- read.csv("/Users/u0847758/Desktop/CAP/customer_address_and_zip_mapping.csv")
+DeliveryCostData <- read_excel("/Users/u0847758/Desktop/CAP/delivery_cost_data (1).xlsx")
+```
+
+
+```{r}
+#clean the address data
+# Split the column
+AddressZipData <- AddressZipData |>
+  separate(full.address, into = c("ZIP", "City", "State Name", "State Short", 
+                                  "County","Code", "Latitude", "Longitude"), sep = ",")
+
+AddressZipData$Latitude <- as.numeric(AddressZipData$Latitude)
+
+AddressZipData$Longitude <- as.numeric(AddressZipData$Longitude)
+```
+
+```{r}
+
+# Make sure transaction date is a date
+TransactionalData <- TransactionalData |>
+  mutate(TRANSACTION_DATE = as.Date(TRANSACTION_DATE))
+
+# Create total volume (gallons + cases)
+TransactionalData <- TransactionalData |>
+  mutate(
+    total_volume = ORDERED_GALLONS + ORDERED_CASES,
+    total_delivered = DELIVERED_GALLONS + DELIVERED_CASES,
+    prop_delivered = total_delivered/total_volume)
+
+# Aggregate by customer_id and year
+annual_volumes <- TransactionalData |>
+  group_by(CUSTOMER_NUMBER, YEAR) |>
+  summarise(
+    total_gallons = sum(ORDERED_GALLONS),
+    total_cases = sum(ORDERED_CASES),
+    total_volume = sum(total_volume),
+    total_delivered = sum(total_delivered),
+    prop_delivered = total_delivered/total_volume,
+    .groups = "drop")
+
+head(annual_volumes)
+
+volumes_wide <- annual_volumes |>
+  pivot_wider(
+    names_from = YEAR,
+    values_from = c(total_gallons, total_cases, total_volume, total_delivered, prop_delivered),
+    names_glue = "{.value}_{YEAR}"
+  )
+
+glimpse(volumes_wide)
+```
+
+join to profile 
+```{r}
+
+customer_full <- volumes_wide |>
+  left_join(CustomerProfileData, by = "CUSTOMER_NUMBER")
+
+```
+
+
+```{r}
+CustomerProfile_Location <- CustomerProfileData %>% 
+  left_join(AddressZipData, by = c("ZIP_CODE"="zip")) 
+
+```
+
+* do KMeans clustering to identify the four main location clusters
+* identify the center (Centroid) of each of the four main clusters
+```{r}
+#cluster the addresses and calculate the centroid for each cluster
+##Multiple centroids
+set.seed(123)
+
+kmeans_result <- kmeans(CustomerProfile_Location[,c("Longitude", "Latitude")], centers = 4)
+
+CustomerProfile_Location$cluster <- as.factor(kmeans_result$cluster)
+
+
+centroids <- CustomerProfile_Location %>% 
+  group_by(cluster) %>% 
+  summarize(centroid_lon = mean(Longitude), centroid_lat = mean(Latitude))
+
+haversine_distance <- function(lon1, lat1, lon2, lat2) {
+  distHaversine(c(lon1, lat1), c(lon2,lat2))/1609.34 
+}# converts meters to miles
+
+#Join main customer data to the clusters created above
+CustomerProfile_Location <- CustomerProfile_Location %>% 
+  left_join(centroids, by = "cluster")
+
+
+CustomerProfile_Location <- CustomerProfile_Location %>% 
+  mutate(
+    distance_to_centroid = mapply(haversine_distance, CustomerProfile_Location$Longitude, CustomerProfile_Location$Latitude, CustomerProfile_Location$centroid_lon, CustomerProfile_Location$centroid_lat)
+  )
+
+str(customer_full$CUSTOMER_NUMBER)
+str(CustomerProfile_Location$CUSTOMER_NUMBER)
+
+cluster_info <- CustomerProfile_Location |>
+  select(CUSTOMER_NUMBER, cluster, distance_to_centroid)
+
+customer_full <- customer_full |>
+  left_join(cluster_info, by = "CUSTOMER_NUMBER")
+
+
+
+```
+
+
+
+I want to use multi level modeling and understand the impact being a retailer vs not has as well as LMP status, Co2, clusters things like that. 
+
+I needed to start first with a larger data source, that is the customer level, order totals for 23 and 24, with parent indicators, but not summated at the parent level, 
+
+now i need to create two columns, part of outlet, and size of retialer to use in mlm
+
+```{r}
+customer_full <- customer_full |>
+  mutate(
+    LOCAL_MARKET_PARTNER = as.factor(LOCAL_MARKET_PARTNER),
+    CO2_CUSTOMER = as.factor(CO2_CUSTOMER)
+  )
+
+# add retailer size to customer level data 
+group_size <- customer_full |>
+  filter(!is.na(PRIMARY_GROUP_NUMBER)) |>
+  group_by(PRIMARY_GROUP_NUMBER) |>
+  summarise(retailer_size = n_distinct(CUSTOMER_NUMBER), .groups = "drop")
+
+
+
+
+
+```
+
+
+```{r}
+
+customer_full |>
+  mutate(
+    missing_2023 = is.na(total_volume_2023),
+    missing_2024 = is.na(total_volume_2024)
+  ) %>%
+  count(missing_2023, missing_2024)
+
+
+customer_full <- customer_full |>
+  mutate(
+    total_volume_2023 = replace_na(total_volume_2023, 0),
+    total_volume_2024 = replace_na(total_volume_2024, 0),
+    total_gallons_2023 = replace_na(total_gallons_2023, 0),
+    total_gallons_2024 = replace_na(total_gallons_2024, 0),
+    total_cases_2023 = replace_na(total_cases_2023, 0),
+    total_cases_2024 = replace_na(total_cases_2024, 0),
+    total_delivered_2023 = replace_na(total_delivered_2023, 0),
+    total_delivered_2024 = replace_na(total_delivered_2024, 0),
+    prop_delivered_2023 = ifelse(total_volume_2023 == 0, 0, total_delivered_2023 / total_volume_2023),
+    prop_delivered_2024 = ifelse(total_volume_2024 == 0, 0, total_delivered_2024 / total_volume_2024),
+    volume_change = total_volume_2024 - total_volume_2023
+  )
+
+
+
+
+summary(customer_full$volume_change)
+hist(customer_full$volume_change, breaks = 50)
+
+colSums(is.na(customer_full))
+
+colnames(customer_full)
+
+
+customer_full <- customer_full |>
+  mutate(
+    propCases = (total_cases_2023 + total_cases_2024) / 
+                (total_cases_2023 + total_cases_2024 + total_gallons_2023 + total_gallons_2024),
+    hasOrderedCases = if_else(total_cases_2023 > 0 | total_cases_2024 > 0, 1, 0)
+  )
+
+customer_full <- customer_full |>
+  mutate(
+    total_ordered_2023 = total_volume_2023 ,
+    total_ordered_2024 = total_volume_2024,
+    percentChangeYOY = (volume_change) / total_ordered_2023)
+
+
+# some customers a part of retailers have weird situations where order amounts are 0 
+customer_full <- customer_full |>
+  mutate(percentChangeYOY = if_else(total_ordered_2023 == 0 & total_ordered_2024 == 0, 0, percentChangeYOY))
+
+str(customer_full)
+
+# fixing YoY infinite issues. 
+
+customer_full <- customer_full |>
+  mutate(
+    total_ordered_2023_adj = ifelse(total_ordered_2023 == 0 & total_ordered_2024 > 0, 1, total_ordered_2023),
+    percentChangeYOY = (total_ordered_2024 - total_ordered_2023_adj) / total_ordered_2023_adj
+  )
+
+# fixing the issue for customers who were on boarded in 23 and 24 and are showing super high YoY values 
+
+# using smoothed percentage change maybe should have explored a log diff order value instead of YoY change but oh well. 
+
+customer_full <- customer_full |>
+  mutate(
+    percentChangeYOY = ifelse(
+      total_ordered_2023 == 0 & total_ordered_2024 > 0,
+      log1p(total_ordered_2024),  # smooth log growth
+      percentChangeYOY            # leave everything else as-is
+    )
+  )
+
+
+customer_full <- customer_full |>
+  mutate(
+    percentChangeYOY = case_when(total_ordered_2023 == 0 & total_ordered_2024 == 0 ~ 0,TRUE ~ percentChangeYOY
+    )
+  )
+
+
+customer_full <- customer_full |>
+  mutate(
+    Binning_column = case_when(
+      total_ordered_2023 < 400 & total_ordered_2024 < 400 & percentChangeYOY <= 0.10 ~ "low volume low growth",
+      total_ordered_2023 < 400 & total_ordered_2024 < 400 & percentChangeYOY > 0.10 ~ "low volume high growth",
+      total_ordered_2023 > 400 & total_ordered_2024 > 400 & percentChangeYOY < 0.05 ~ "high volume low growth",
+      total_ordered_2023 > 400 & total_ordered_2024 > 400 & percentChangeYOY > 0.05 ~ "high volume high growth",
+      (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY >= 0 ~ "transitionary growing",
+      (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY < 0 ~ "transitionary declining",
+      TRUE ~ "unclassified"
+    )
+  )
+
+
+
+
+
+# set retailer and non retailer data. 
+
+retailer_set <- customer_full |>
+  filter(!is.na(PRIMARY_GROUP_NUMBER))
+
+non_retailer_set <- customer_full |>
+  filter(is.na(PRIMARY_GROUP_NUMBER))
+
+colnames(retailer_set)
+
+
+str(retailer_set)
+
+library(lubridate)
+
+retailer_set <- retailer_set |>
+  mutate(
+    ON_BOARDING_DATE = mdy(ON_BOARDING_DATE),           # convert from "8/5/2015" style to Date
+    onboarding_year = year(ON_BOARDING_DATE),           # extract year
+    customer_age = 2025 - onboarding_year               # calculate age relative to 2025
+  )
+
+
+
+
+```
+
+# HERE 4/4/25
+
+```{r}
+# linear mlm one
+
+str(retailer_set)
+
+
+retailer_set <- retailer_set |>
+  mutate(
+    PRIMARY_GROUP_NUMBER = as.factor(PRIMARY_GROUP_NUMBER),
+    FREQUENT_ORDER_TYPE = as.factor(FREQUENT_ORDER_TYPE),
+    Binning_column = as.factor(Binning_column),
+    LOCAL_MARKET_PARTNER = as.factor(LOCAL_MARKET_PARTNER),
+    CO2_CUSTOMER = as.factor(CO2_CUSTOMER),
+    cluster = as.factor(cluster)
+  )
+
+
+mlm_one <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER +  percentChangeYOY + distance_to_centroid + propCases +
+    (1 | PRIMARY_GROUP_NUMBER), 
+  data = retailer_set
+)
+
+
+
+summary(mlm_one)
+
+summary(mlm_one)
+r2(mlm_one)
+
+ranef(mlm_one)$PRIMARY_GROUP_NUMBER %>% head()
+
+
+
+
+```
+Goal: Predict total orders in 2024 based on 2023 behavior + customer features, adjusting for differences across retailer groups (Primary Group Number).
+
+
+Marginal R² (Fixed Effects only): 0.879
+→ This means the fixed effects (like total_ordered_2023, CO2_CUSTOMER, etc.) alone explain ~88% of the variation in 2024 orders.
+
+Conditional R² (Fixed + Random Effects): 0.989
+→ When you include differences between retail groups, you explain ~99% of the variation.
+✅ This means retail group membership really matters — you're modeling group-level patterns successfully.
+
+
+
+
+Predictor	Interpretation
+total_ordered_2023	✅ Very strong (t = 510!) – more in 2023 → more in 2024.
+percentChangeYOY	✅ Higher YoY change → growth continues.
+CO2_CUSTOMERTRUE	✅ Positive impact (adds ~112 units on avg).
+LOCAL_MARKET_PARTNERTRUE	✅ Significant positive effect (adds ~203 units).
+Order Type	❌ Not significant here — coefficients vary but none are strong.
+customer_age, distance_to_centroid, propCases	❌ No significant effect.
+
+
+Your random intercepts (like ranef(mlm_one)$PRIMARY_GROUP_NUMBER) show how each retailer group deviates from the average expected 2024 volume after adjusting for customer behavior. For example:
+
+So: Group 21 performs ~387 units above average on top of the expected volume from fixed effects.
+
+
+
+```{r}
+# mlm two only using binning 
+
+
+mlm_two <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases + 
+    (1 | Binning_column),
+  data = retailer_set
+)
+
+summary(mlm_two)
+r2(mlm_two)
+
+ranef(mlm_two)$Binning_column %>% head()
+
+
+
+```
+
+
+Model: mlm_two
+Random effect: Binning_column
+
+Data used: retailer_set
+
+Target: total_ordered_2024
+
+
+
+Interpretation:
+🔁 Random Effects
+The variance from Binning_column (442.7) is much smaller than the residual variance (1,527).
+
+That suggests the binning groups (like "high volume low growth", etc.) explain a small amount of the variation in total orders after controlling for the fixed effects.
+
+So yes, binning has some effect, but it’s much less impactful than PRIMARY_GROUP_NUMBER was in your previous model.
+
+📌 Fixed Effects:
+total_ordered_2023 remains the most dominant predictor — just like we saw earlier.
+
+percentChangeYOY is highly significant and positive again ✅
+
+LOCAL_MARKET_PARTNER is marginally significant.
+
+All other variables (frequent order type, CO2, etc.) are not significant in this model.
+
+
+Comparing to Step 1 (Primary Group Model):
+mlm_primary_group	mlm_two (binning only)
+Conditional R²	0.989	0.966
+Marginal R²	0.879	0.963
+AIC (REML criterion)	85,017.9	87,307
+Residual Std. Dev.	939.4	1,527
+Random Effect Group	Primary Group	Binning Column
+Random Effect Variance	2.98M	~196K
+
+
+Conclusion so far:
+mlm_primary_1 is the better model. It explains more variation and fits better by AIC.
+
+
+
+Binning Group	Random Intercept	Interpretation
+transitionary growing	+488.99	🚀 Above average — even after accounting for prior volume, age, CO2, LMP, etc., this group orders more than expected in 2024. These are strong upward movers.
+high volume high growth	+439.73	✅ Still very strong. These groups are maintaining high performance and even exceeding expectations.
+low volume low growth	+68.33	🔹 Slightly better than expected — not growing fast, but not underperforming.
+low volume high growth	+10.69	🟰 Near average — growth is happening but not drastically beyond what you'd predict from other factors.
+transitionary declining	−437.18	🛑 Way below expectations — this group is dropping off even more than what prior volume or other predictors would suggest.
+high volume low growth	−570.56	⚠️ Underwhelming performance — these groups had high volume, but their lack of growth is worse than expected after controlling for other drivers.
+
+
+
+
+
+
+Top Targets: transitionary growing groups — they’re heating up even more than expected. These could be ripe for cross-sell, new products, route expansion, etc.
+
+Strategic Concerns: high volume low growth groups — may need proactive engagement. These are high-value accounts at risk of stagnation.
+
+Tail Strategy: transitionary declining groups — investigate why they’re underperforming so sharply. Competitor? Operational issue?
+
+
+
+
+
+
+
+
+
+```{r}
+# mlm three! 
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases  +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+
+summary(mlm_three)
+performance::r2(mlm_three)
+
+
+ranef(mlm_three)$PRIMARY_GROUP_NUMBER %>% head()
+ranef(mlm_three)$Binning_column %>% arrange(desc(`(Intercept)`))
+
+
+
+
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases  +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+
+summary(mlm_three)
+
+```
+Conditional R² (0.990): The model explains 99% of the total variation in 2024 orders including group-level effects. Excellent fit.
+
+Marginal R² (0.879): The fixed effects alone explain ~88% of the variation — strong performance.
+
+REML Criterion (84665.3): Lower than previous MLMs, suggesting a better overall model (though we’ll finalize that once RMSE is added).
+
+
+
+
+
+
+ Key Fixed Effects
+Predictor	Estimate	Significance	Interpretation
+total_ordered_2023	+1.16	***	The strongest predictor. Baseline volume drives future growth.
+CO2_CUSTOMERTRUE	+120	**	CO2 customers order more in 2024.
+LOCAL_MARKET_PARTNERTRUE	+156	**	LMP customers order more in 2024.
+percentChangeYOY	+74	***	High YoY growth in % is strongly linked to 2024 ordering.
+Other order types	Small or non-sig	Little added predictive value in this version.
+
+
+
+Group	Std. Dev.	What it tells us
+PRIMARY_GROUP_NUMBER	2954	Large variation across retailer groups — supports earlier findings.
+Binning_column	396.5	Still meaningful variation across bins, but smaller than between retailer groups.
+Residual	900.2	Most remaining noise is at the individual customer level.
+
+
+
+Interpretation of Random Intercepts (Binning_column)
+These intercepts show how much each customer segment (based on past performance) deviates from the global average in their expected 2024 ordering, after accounting for all fixed effects like volume, CO2, LMP, etc.
+
+Binning Group	Intercept	Meaning
+🟢 Transitionary Growing	+442.6	These customers are rapidly ramping up — the model expects them to significantly outperform their peers.
+🟢 High Volume High Growth	+335.6	These are reliable high performers — strong past + continued growth.
+🟡 Low Volume Low Growth	+89.1	Small positive lift — these are stable but low-output accounts.
+🟡 Low Volume High Growth	+67.0	Model sees some growth potential, but not dramatically high. Possibly constrained by size.
+🔴 Transitionary Declining	-379.9	These accounts are slipping — strong prior performance, but dropping off. Model expects underperformance.
+🔴 High Volume Low Growth	-554.5	🚨 These are your most concerning group — large but stagnating. Highest potential for intervention or reactivation efforts.
+🧭 Strategic Implication
+This random effect structure confirms that customer segments explain meaningful variation, even after controlling for all other known predictors. The model is telling you:
+
+"If you tell me a customer's bin (like 'transitionary growing'), I can better predict their performance."
+
+So including Binning_column helps capture latent behavioral patterns — exactly what you hypothesized earlier.
+
+
+
+How to Interpret These Group Intercepts
+Each value represents how much a given retail group (e.g., group 17, 19, etc.) deviates from the global average prediction, after accounting for:
+
+2023 order volume
+
+CO2 / LMP / age / channel
+
+Growth % (percentChangeYoY)
+
+And the effects of the Binning_column
+
+Group ID	Random Intercept	Meaning
+167	+497.3	📈 Strong-performing retailer group — customers here consistently order more than expected.
+21	+315.4	📈 Another outperforming group — possible reliable performer.
+19	+191.0	👍 Still above average, but less extreme.
+104	+218.6	👍 Also outperforming.
+251	+239.6	✅ Solid performer.
+17	+256.8	✅ Another strong retail group.
+🧭 Strategic Takeaways for Swire
+These retailer group effects capture unobserved patterns — maybe sales culture, regional practices, or management that you didn’t include explicitly.
+
+High intercept + underwhelming performance = 🔥 group to target (they should be doing better).
+
+Low intercept + strong performance = 🚨 unexpected overperformance — worth digging into what they’re doing right.
+
+This is precisely why multi-level modeling shines: it quantifies both individual-level and group-level contributions to growth, helping you target both customer and group strategies.
+
+
+
+
+
+```{r}
+# compare models performance 
+
+library(performance)
+library(yardstick)
+library(dplyr)
+library(tibble)
+
+# Get model fits
+fitted_pg   <- fitted(mlm_one)
+fitted_bin  <- fitted(mlm_two)
+fitted_both <- fitted(mlm_three)
+
+# Get actuals (same across all models)
+actuals <- retailer_set$total_ordered_2024
+
+# Calculate RMSE manually for each model
+rmse_pg   <- sqrt(mean((actuals - fitted_pg)^2))
+rmse_bin  <- sqrt(mean((actuals - fitted_bin)^2))
+rmse_both <- sqrt(mean((actuals - fitted_both)^2))
+
+# Create comparison table
+model_comparison <- tribble(
+  ~model,                       ~AIC,                  ~marginal_R2,                 ~conditional_R2,               ~RMSE,
+  "MLM 1: Primary Group",       AIC(mlm_one),          r2(mlm_one)$R2_marginal,      r2(mlm_one)$R2_conditional,    rmse_pg,
+  "MLM 2: Binning Column",      AIC(mlm_two),          r2(mlm_two)$R2_marginal,      r2(mlm_two)$R2_conditional,    rmse_bin,
+  "MLM 3: Both Random Effects", AIC(mlm_three),        r2(mlm_three)$R2_marginal,    r2(mlm_three)$R2_conditional,  rmse_both
+)
+
+# View it
+model_comparison
+
+```
+
+Metric	What it tells you
+AIC	Akaike Information Criterion — lower = better model fit with a penalty for complexity
+marginal_R2	R² for fixed effects only — how much variance is explained by your predictors
+conditional_R2	R² for fixed + random effects — total variance explained by the full model
+RMSE	Root Mean Square Error — average prediction error in your outcome units; lower = better
+
+
+ Key Takeaways:
+🔸 MLM 3 (Both Random Effects):
+Has the lowest AIC, which suggests the best overall fit accounting for complexity.
+
+Has highest conditional R² → explains the most total variance.
+
+Marginal R² is similar to MLM 1, so it adds more value from the random effects.
+
+RMSE is a touch higher than MLM 2, but not dramatically.
+
+✅ Best overall model fit.
+
+🔸 MLM 2 (Binning Column only):
+Highest marginal R² (0.96!) → your fixed effects alone explain a huge portion of variance.
+
+But conditional R² is lower than MLM 1 and 3, so your random effects aren’t adding much.
+
+Lowest RMSE, so it makes slightly more accurate predictions on average.
+
+✅ Best model for fixed-effect explanatory power or predictive performance.
+
+🔸 MLM 1 (Primary Group only):
+Lower AIC than MLM 2 but higher than MLM 3.
+
+Marginal R² and conditional R² are solid — better than MLM 2 in total explained variance, worse than MLM 3.
+
+✅ Middle ground model.
+
+🔮 What to Do:
+If your goal is prediction, you might favor MLM 2 for the lowest RMSE.
+
+If your goal is explaining structure (especially accounting for hierarchical group effects), MLM 3 wins — great balance of fixed and random contributions.
+
+Use marginal vs conditional R² to gauge how much variance your random effects are adding.
+
+
+
+
+
+
+
+🧠 What This Tells You
+MLM 3 (Both Random Effects) has the best AIC and Conditional R², meaning it explains the most variance when group-level patterns are considered.
+
+MLM 2 (Binning Only) has best RMSE and Marginal R², meaning its fixed effects (especially growth bin behavior) are very strong on their own.
+
+MLM 1 (Primary Group Only) also performs well but isn’t the strongest in any single metric.
+
+
+“When accounting for both group-level retailer behavior and customer performance segments, our model achieves a Conditional R² of 0.99 and performs comparably in RMSE. This reinforces the importance of both macro-level (retailer) and behavioral (binning) variation.”
+
+
+## 
+
+
+```{r}
+## presentation actual vs predicted: 
+
+set.seed(123)  # For reproducibility
+
+# 1. Split 80/20
+n <- nrow(retailer_set)
+train_indices <- sample(seq_len(n), size = 0.8 * n)
+
+train_data <- retailer_set[train_indices, ]
+test_data  <- retailer_set[-train_indices, ]
+
+# 2. Fit MLM model on training data
+mlm_three_train <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = train_data
+)
+
+# Optional: trim extreme outliers for cleaner visual
+test_data_filtered <- test_data |>
+  filter(pred_mlm_3 < 100000, total_ordered_2024 < 100000)
+
+
+
+
+# 3. Predict on test data
+test_data <- test_data |>
+  mutate(predicted_2024 = pmax(predict(mlm_three_train, newdata = test_data, allow.new.levels = TRUE), 0
+ ))
+
+# 4. Plot actual vs predicted
+library(ggplot2)
+
+ggplot(test_data, aes(x = total_ordered_2024, y = predicted_2024)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "darkgreen") +
+  labs(
+    x = "Actuals",
+    y = "Predicted" ) +
+  theme_minimal()
+
+
+
+test_data_filtered <- test_data |>
+  filter(predicted_2024 < 100000)
+
+
+
+actual_vs_predicted_2024.png <- ggplot(test_data_filtered, aes(x = total_ordered_2024, y = predicted_2024)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(x = "Actual", y = "Predicted") +
+  scale_y_continuous(labels = label_number(scale = 1e-3, suffix = "K"))+
+  scale_x_continuous(labels = label_number(scale = 1e-3, suffix = "K"))+
+  theme_minimal()+
+   theme( 
+    panel.grid = element_blank(), 
+    axis.line = element_line(color = "black"),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)) 
+
+
+ggsave("actual_vs_predicted_2024.png", plot = actual_vs_predicted_2024.png, width = 8, height = 6, dpi = 300)
+
+
+
+
+```
+
+
+plot for all three:
+
+```{r}
+
+
+
+mlm_one_train <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER +  percentChangeYOY + distance_to_centroid + propCases +
+    (1 | PRIMARY_GROUP_NUMBER), 
+  data = train_data
+)
+
+mlm_two_train <-lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases + 
+    (1 | Binning_column),
+  data = train_data
+)
+
+
+
+test_data <- test_data |>
+  mutate(
+    pred_mlm_1 = pmax(predict(mlm_one_train, newdata = test_data, allow.new.levels = TRUE), 0),
+    pred_mlm_2 = pmax(predict(mlm_two_train, newdata = test_data, allow.new.levels = TRUE), 0),
+    pred_mlm_3 = pmax(predict(mlm_three_train, newdata = test_data, allow.new.levels = TRUE), 0)
+  )
+
+test_data_filtered <- test_data |>
+  filter(pred_mlm_3 < 100000, total_ordered_2024 < 100000)
+
+
+# Reshape data for ggplot
+long_preds <- test_data_filtered |>
+  select(total_ordered_2024, pred_mlm_1, pred_mlm_2, pred_mlm_3) |>
+  pivot_longer(cols = starts_with("pred_"), names_to = "model", values_to = "prediction")
+
+# Relabel for nicer legend
+long_preds$model <- recode(long_preds$model,
+  pred_mlm_1 = "MLM 1 (Primary Group)",
+  pred_mlm_2 = "MLM 2 (Binning)",
+  pred_mlm_3 = "MLM 3 (Both)"
+)
+
+# 🎨 Plot: Actual vs Predicted for all three models
+plot_all_models <- ggplot(long_preds, aes(x = total_ordered_2024, y = prediction, color = model)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("red", "blue", "darkgreen")) +
+  labs(
+    title = "Actual vs Predicted: MLM 1 vs 2 vs 3",
+    x = "Actual Orders (2024)",
+    y = "Predicted Orders",
+    color = "Model"
+  ) +
+  scale_y_continuous(labels = label_number(scale = 1e-3, suffix = "K")) +
+  scale_x_continuous(labels = label_number(scale = 1e-3, suffix = "K")) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white")
+  )
+
+# Save the plot
+ggsave("actual_vs_predicted_all_models.png", plot = plot_all_models, width = 9, height = 6, dpi = 300)
+
+
+```
+
+## PRESENTATION WORK:
+
+```{r}
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases  +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+# Step 1: Extract and convert to dataframe
+retailer_effects <- ranef(mlm_three)$PRIMARY_GROUP_NUMBER %>%
+  rownames_to_column(var = "PRIMARY_GROUP_NUMBER") %>%
+  rename(intercept = `(Intercept)`) %>%
+  arrange(desc(intercept))
+
+
+# Step 2: Get cutoff for top 25% of random intercepts
+threshold_75 <- quantile(retailer_effects$intercept, 0.75, na.rm = TRUE)
+
+# Step 3: Filter retailer groups in the top 25%
+top_retailers <- retailer_effects %>%
+  filter(intercept >= threshold_75)
+
+# Step 4: Summarize their characteristics
+strong_summary <- strong_customers %>%
+  summarise(
+    avg_2023_orders = mean(total_ordered_2023, na.rm = TRUE),
+    avg_2024_orders = mean(total_ordered_2024, na.rm = TRUE),
+    avg_onboarding_year = mean(onboarding_year, na.rm = TRUE),
+    avg_propCases = mean(propCases, na.rm = TRUE),
+    percent_LMP = mean(LOCAL_MARKET_PARTNER == "TRUE"),
+    percent_CO2 = mean(CO2_CUSTOMER == "TRUE"),
+    avg_customer_age = mean(customer_age, na.rm = TRUE),
+     most_common_binning = names(sort(table(Binning_column), decreasing = TRUE))[1]
+  )
+
+print(strong_summary)
+
+
+
+# Step 1: Get cutoff for bottom 25%
+threshold_25 <- quantile(retailer_effects$intercept, 0.25, na.rm = TRUE)
+
+# Step 2: Filter retailer groups in the bottom 25%
+bottom_retailers <- retailer_effects %>%
+  filter(intercept <= threshold_25)
+
+# Step 3: Get customers in those groups
+weak_customers <- retailer_set %>%
+  filter(PRIMARY_GROUP_NUMBER %in% bottom_retailers$PRIMARY_GROUP_NUMBER)
+
+# Step 4: Summarize their characteristics
+weak_summary <- weak_customers %>%
+  summarise(
+    avg_2023_orders = mean(total_ordered_2023, na.rm = TRUE),
+    avg_2024_orders = mean(total_ordered_2024, na.rm = TRUE),
+    avg_onboarding_year = mean(onboarding_year, na.rm = TRUE),
+    avg_propCases = mean(propCases, na.rm = TRUE),
+    percent_LMP = mean(LOCAL_MARKET_PARTNER == "TRUE"),
+    percent_CO2 = mean(CO2_CUSTOMER == "TRUE"),
+    avg_customer_age = mean(customer_age, na.rm = TRUE),
+     most_common_binning = names(sort(table(Binning_column), decreasing = TRUE))[1]
+  )
+
+print(weak_summary)
+
+print(strong_summary)
+
+summary(mlm_three)
+
+
+retailer_set %>%
+  group_by(Binning_column) %>%
+  summarise(count = n()) %>%
+  mutate(
+    proportion = count / sum(count),
+    proportion_label = scales::percent(proportion, accuracy = 0.1)
+  ) %>%
+  arrange(desc(proportion))
+
+```
+
+
+## cross validation, 
+
+Totally fair — since you're using this model to simulate/predict 2025, it does make sense to run some form of cross-validation or holdout testing to give Swire (and yourself) confidence that your model:
+
+Generalizes well to new unseen data
+
+Isn’t just fitting noise in 2023 → 2024 behavior
+
+Can reasonably project performance into 2025
+
+
+
+Because your MLM uses PRIMARY_GROUP_NUMBER (retailer group) and Binning_column as random effects, you don’t want to randomly split rows — you want to split by group.
+
+Here’s the plan:
+Split your dataset by group, keeping all customers from a single retail group in either train or test.
+
+Train your MLM on the training groups.
+
+Predict on the held-out test groups and calculate RMSE.
+
+This simulates how your model might perform on totally new retail groups in 2025.
+
+```{r}
+
+
+# scale for model improvment
+
+retailer_set <- retailer_set |>
+  mutate(
+    total_ordered_2023_scaled = scale(total_ordered_2023)
+  )
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023_scaled + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+# cross validtation
+
+set.seed(123)  # Reproducibility
+
+# Fold assignment by retailer group
+group_folds <- retailer_set |>
+  distinct(PRIMARY_GROUP_NUMBER) |>
+  mutate(fold = sample(rep(1:5, length.out = n())))
+
+retailer_set_cv <- retailer_set |>
+  left_join(group_folds, by = "PRIMARY_GROUP_NUMBER")
+
+# Cross-validation loop
+cv_results <- map_df(1:5, function(fold_num) {
+  
+  # Train/test split
+  train_data <- retailer_set_cv |>
+    filter(fold != fold_num)
+  test_data  <- retailer_set_cv |>
+    filter(fold == fold_num)
+  
+  # Fit MLM
+  model <- lmer(
+    total_ordered_2024 ~ total_ordered_2023_scaled + FREQUENT_ORDER_TYPE +
+      LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY +
+      distance_to_centroid + propCases  +
+      (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+    data = train_data
+  )
+  
+  # Predict on test
+  preds <- predict(model, newdata = test_data, allow.new.levels = TRUE)
+  
+  # Calculate metrics
+  rmse_val <- rmse_vec(test_data$total_ordered_2024, preds)
+  r2_vals  <- performance::r2(model)
+  
+  tibble(
+    fold = fold_num,
+    rmse = rmse_val,
+    marginal_r2 = r2_vals$R2_marginal,
+    conditional_r2 = r2_vals$R2_conditional
+  )
+})
+
+# Summary across folds
+cv_results_summary <- cv_results |>
+  summarise(
+    mean_rmse = mean(rmse),
+    sd_rmse = sd(rmse),
+    mean_marginal_r2 = mean(marginal_r2),
+    mean_conditional_r2 = mean(conditional_r2)
+  )
+
+# View
+print(cv_results)
+print(cv_results_summary)
+
+```
+
+Interpretation
+RMSE (Root Mean Squared Error): Lower is better. Folds 1–3 are very tight and solid (under 1700), while folds 4 and 5 are higher — suggesting some variability in prediction accuracy depending on the fold (probably tied to differences in retailer group mix).
+
+Marginal R²: Shows how much variance is explained by fixed effects only. Fold 4 is a bit of an outlier here (0.729), but the rest are strong (0.85–0.97).
+
+Conditional R²: Reflects total variance explained including random effects — all folds are above 0.98, which is excellent and consistent.
+
+
+
+Compared to Before (Full Model):
+Your earlier full model (no CV) had:
+
+RMSE around 11,648
+
+Marginal R² ~0.879
+
+Conditional R² ~0.990
+
+So:
+
+Cross-validated performance is very strong, and actually more reassuring — most folds beat the full-model RMSE, and R² is consistently high.
+
+Variability in RMSE across folds is something to keep an eye on, but not a dealbreaker.
+
+
+
+## ready for predictions 
+
+
+
+well i used the 23 data to predict 24, now i want to use the same 24 data that already exists in my retailer mix to get 25, dont i need to like set 23 to 24 or something like  mutate(total_ordered_2023 = total_ordered_2024) %>% 
+  select(-total_ordered_2024)
+
+
+```{r}
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+
+retailer_set <- retailer_set |>
+  group_by(PRIMARY_GROUP_NUMBER) |>
+  mutate(retailer_size = n()) |>
+  ungroup()
+
+
+
+mlm_three_half <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases + retailer_size +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+summary(mlm_three_half)
+
+
+# Step 1: Create prediction set using 2024 as the new baseline
+predict_2025_data <- retailer_set |>
+  mutate(
+    total_ordered_2023 = total_ordered_2024,      # use 2024 as the new baseline
+    customer_age = customer_age + 1               # increment age
+  ) %>%
+  select(-total_ordered_2024)                      # drop old 2024 column to simulate 2025
+
+# Step 2: Predict 2025 using the best model
+predicted_2025 <- predict(mlm_three, newdata = predict_2025_data, allow.new.levels = TRUE)
+
+# Step 3: Attach predictions back to data
+predict_2025_data <- predict_2025_data %>%
+  mutate(predicted_total_ordered_2025 = predicted_2025)
+
+# ✅ Step 4: Recalculate percentChangeYoY now that we have predictions
+predict_2025_data <- predict_2025_data %>%
+  mutate(
+    percentChangeYoY = (predicted_total_ordered_2025 - total_ordered_2023) / total_ordered_2023
+  )
+
+
+```
+
+
+When it’s fine to "just run with it":
+If:
+
+You’re sticking with the same predictors (just sub in 2024 data in place of 2023),
+
+The model generalizes well (which your metrics suggest it does — conditional R² = 0.99 is killer),
+
+You don’t need hyper-optimized coefficients and your focus is on insightful, practical predictions,
+
+→ Then go ahead and re-fit Model 3 using 2024 data to predict 2025.
+
+
+## actual vs predicted: 
+
+```{r}
+
+
+```
+
+
+
+
+
+
+## insights! 
+
+“Which customers are predicted to exceed 400 in 2025, but did not exceed 400 in 2024?”
+
+
+
+```{r}
+
+
+# Create a binary indicator of exceeding 400 in 2024 (which is now stored in total_ordered_2023)
+predict_2025_data <- predict_2025_data |>
+  mutate(
+    grew_2024 = total_ordered_2023 > 400,
+    predicted_grow_2025 = predicted_total_ordered_2025 > 400
+  )
+
+
+predict_2025_data <- predict_2025_data |>
+  mutate(
+    grew_2024 = total_ordered_2023 > 400,
+    predicted_grow_2025 = predicted_total_ordered_2025 > 400
+  )
+
+
+# Filter for new growers: not over 400 in 2024, but predicted to be in 2025
+emerging_2025_growers <- predict_2025_data %>%
+  filter(!grew_2024 & predicted_grow_2025)
+
+
+
+# Summary: how many?
+nrow(emerging_2025_growers)
+
+
+# % of all customers that are projected to newly grow
+nrow(emerging_2025_growers) / nrow(predict_2025_data)
+
+# Average predicted volume of new growers
+mean(emerging_2025_growers$predicted_total_ordered_2025)
+
+mean(emerging_2025_growers$total_ordered_2023)
+
+
+# Distribution
+ggplot(emerging_2025_growers, aes(x = predicted_total_ordered_2025)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Predicted Volume for New 2025 Growers")
+
+
+(44 * 411) + (519 * 535)
+```
+
+
+```{r}
+emerging_2025_growers |>
+  select(
+    CUSTOMER_NUMBER,
+    Binning_column,
+    total_ordered_2023,               # really their 2024 volume
+    predicted_total_ordered_2025,
+    FREQUENT_ORDER_TYPE,
+    LOCAL_MARKET_PARTNER,
+    CO2_CUSTOMER,
+    customer_age,
+    percentChangeYOY,
+    distance_to_centroid,
+    propCases,
+    retailer_size
+  ) %>%
+  arrange(desc(predicted_total_ordered_2025)) %>%
+  head(20)
+
+
+emerging_2025_growers %>%
+  group_by(Binning_column) %>%
+  summarise(
+    count = n(),
+    avg_predicted_2025 = mean(predicted_total_ordered_2025),
+    avg_2024_order = mean(total_ordered_2023),
+    avg_age = mean(customer_age),
+    percent_LMP = mean(LOCAL_MARKET_PARTNER == "TRUE"),
+    percent_CO2 = mean(CO2_CUSTOMER == "TRUE")
+  ) %>%
+  arrange(desc(count))
+
+
+
+```
+
+
+
+# transitionalry grower 
+
+Are customers who were "transitionary growers" in 2024 expected to keep growing in 2025?
+
+If their average predicted 2025 volume is:
+
+Higher than 2024 → that bin continues to grow → 📈 sustained momentum.
+
+Flat or lower → they may have plateaued or regressed → 🟨 watch list.
+
+
+
+```{r}
+
+# From original data
+avg_2024 <- retailer_set %>%
+  filter(Binning_column == "transitionary growing") %>%
+  summarise(avg_2024 = mean(total_ordered_2024, na.rm = TRUE))
+
+# From predicted 2025
+avg_2025 <- predict_2025_data %>%
+  filter(Binning_column == "transitionary growing") %>%
+  summarise(avg_predicted_2025 = mean(predicted_total_ordered_2025, na.rm = TRUE))
+
+bind_cols(avg_2024, avg_2025)
+
+```
+
+SCALING HURT 2025 predictions, transitionary growers were already 400 in 2024, 
+
+i mean but couldnt we say like with average orderd glalon predictions we expect X number of vuture gallons to be lost if you were to off board these current custoemrs who are under 400 right now> 
+
+
+```{r}
+
+# Step 1: Ensure you have the correct data for predictions
+at_risk_customers <- retailer_set %>%
+  filter(total_ordered_2023 < 400)  # Identify the at-risk customers
+
+# Step 2: Predict 2025 values for these at-risk customers
+predicted_2025 <- predict(mlm_three, newdata = at_risk_customers, allow.new.levels = TRUE)
+
+# Step 3: Add predicted values to the dataset
+at_risk_customers <- at_risk_customers %>%
+  mutate(predicted_2025 = predicted_2025)
+
+# Step 4: Calculate total predicted volume loss for 2025
+total_predicted_loss_2025 <- at_risk_customers %>%
+  summarise(total_loss = sum(predicted_2025, na.rm = TRUE))
+
+# Print the result
+print(total_predicted_loss_2025)
+
+
+```
+
+Explanation:
+Step 1: Filters out the at-risk customers who have less than 400 gallons ordered in 2023.
+
+Step 2: Makes predictions for 2025 using the MLM model (mlm_three).
+
+Step 3: Adds the predicted values (predicted_2025) to the at_risk_customers dataset.
+
+Step 4: Sums the predicted values to calculate the total predicted volume loss in 2025 for these at-risk customers.
+
+This approach ensures that the predictions are correctly associated with the corresponding customers. You should now be able to calculate the total predicted loss for 2025.
+
+Let me know if this resolves your issue or if you'd like to dive deeper into the analysis!
+
+
+
+So, if your predicted_2025 value is 618067.4, it is likely representing the total predicted gallons for the at-risk customers who were identified. If you want to confirm the units or explore any conversions, I would recommend checking the documentation or metadata of your dataset, especially the variables like total_ordered_2023 and total_ordered_2024 to verify the units.
+
+
+
+what if we also looked at a lower number like if we want to see people who were not at 400 in 23 but then maybe crossed in either 24 or were predicted to in 25? 
+
+
+what if we also looked at a lower number like if we want to see people who were not at 400 in 23 but then maybe crossed in either 24 or were predicted to in 25? bc transitionary growing was the segment for total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY > 0 ~ "transtionary growin so its already capturing the peple that crossed 400 between 23 and 24, but holistically i am interested in those who are currently under 400 that we think will be over 400 in 2025 did i do that? 
+
+
+Graph ideas:
+appendix graph for model reuslts comparison 
+
+```{r}
+emerging_2025_growers %>%
+  group_by(PRIMARY_GROUP_NUMBER) %>%
+  summarise(
+    count = n(),
+   # retailer_size = mean(retailer_size),
+    avg_predicted_2025 = mean(predicted_total_ordered_2025),
+    avg_2024_order = mean(total_ordered_2023),
+    avg_age = mean(customer_age),
+    percent_LMP = mean(LOCAL_MARKET_PARTNER == "TRUE"),
+    percent_CO2 = mean(CO2_CUSTOMER == "TRUE")
+  ) %>%
+  arrange(desc(count))
+```
+Yes, based on the code you provided earlier, the count represents the number of individual customers within each retailer (primary group) that were predicted to exceed 400 gallons in 2025 but were under 400 gallons in 2024.
+
+This means that you are specifically counting how many customers within each primary group (retailer) moved from below 400 gallons in 2024 to above 400 gallons in 2025, which aligns with identifying "emerging growers."
+
+
+
+
+
+
+```{r}
+
+predict_2025_data <- predict_2025_data |>
+  mutate(
+    over_2024 = total_ordered_2023 > 400,
+    predicted_over_2025 = predicted_total_ordered_2025 > 400,
+    under_24 =  total_ordered_2023 < 400,
+    under_25 = predicted_total_ordered_2025 < 400,
+  )
+
+
+
+# Group by primary group number to see how many customers crossed 400
+primary_group_movement <- predict_2025_data %>%
+  group_by(PRIMARY_GROUP_NUMBER) %>%
+  summarise(
+    over_2024 = sum(over_2024),
+    over_25= sum(predicted_over_2025),
+    under_24 = sum(under_24),
+    under_25 = sum(under_25),
+    .groups = "drop"
+  )
+
+# View top primary groups with the highest movement
+primary_group_movement %>%
+  arrange(desc(over_25)) %>%
+  head(10)
+
+
+```
+
+
+
+
+
+
+
+# PRESENTATION VISUALS:
+
+- "If we used this model to protect the top 25% of at-risk customers from ARTM, we’d save ~X gallons and ~$Y revenue annually."
+
+ 1. Define "at-risk customers"
+You're already doing this: customers under 400 gallons in 2023 (i.e., total_ordered_2023 < 400), which is your baseline.
+
+```{r}
+
+at_risk_customers <- retailer_set |>
+  filter(total_ordered_2024 < 400)
+
+at_risk_customers <- at_risk_customers %>%
+  mutate(
+    total_ordered_2023 = total_ordered_2024,  # Shift forward
+    customer_age = customer_age + 1
+  ) %>%
+  select(-total_ordered_2024) 
+
+
+
+predicted_2025 <- predict(mlm_three, newdata = at_risk_customers, allow.new.levels = TRUE)
+
+at_risk_customers <- at_risk_customers %>%
+  mutate(predicted_total_ordered_2025 = predicted_2025)
+
+top_25pct_at_risk <- at_risk_customers %>%
+  arrange(desc(predicted_total_ordered_2025)) %>%
+  slice_head(prop = 0.25)
+
+top_25pct_at_risk %>%
+  count(onboarding_year, sort = TRUE)
+
+retailer_set%>%
+  count(onboarding_year, sort = TRUE)
+
+
+
+volume_saved <- sum(top_25pct_at_risk$predicted_total_ordered_2025, na.rm = TRUE)
+
+
+```
+
+That means most of your high-potential at-risk customers joined in the last 2–3 years — very useful insight for Swire! It supports the idea that younger accounts might just need more time or support to ramp up.
+
+
+What does “Top 25% of At-Risk Customers” mean?
+You defined at-risk customers as those who ordered less than 400 gallons in 2023, so these are your low-volume accounts.
+
+Now, from that at-risk group, you're using your MLM model to predict 2025 volumes, and you're sorting by those predictions.
+
+So when you take the top 25% of that list, you’re identifying:
+
+💥 The most promising low-volume customers — those predicted to grow the most in 2025.
+
+In other words:
+✅ They’re small today,
+✅ But the model expects them to grow.
+✅ These are your “hidden gems.”
+
+
+```{r}
+mean(top_25pct_at_risk$predicted_total_ordered_2025, na.rm = TRUE)
+
+nrow(top_25pct_at_risk) #1928 
+
+mean(at_risk_customers$predicted_total_ordered_2025, na.rm = TRUE)
+
+mean_top_25 <- mean(top_25pct_at_risk$predicted_total_ordered_2025, na.rm = TRUE)
+uplift_pct <- (mean_top_25 - 391.5306) / 391.5306 * 100
+
+round(uplift_pct)
+
+```
+
+On average, these high-potential at-risk customers are expected to order ~X gallons in 2025. 1380.95
+
+
+Protecting the Top 25% of At-Risk Customers
+
+• At-risk = customers ordering <400 gallons in 2023
+• Top 25% (based on 2025 predicted orders) are expected to order:
+    🔹 ~1,381 gallons on average (vs. 392 gallon overall average)
+• That’s a 253% increase over the average at-risk customer
+
+🧭 Strategic takeaway:
+These are high-potential “hidden growers.”
+Swire should focus retention efforts here to protect future volume.
+
+```{r}
+at_risk_customers %>%
+  summarise(
+    avg_predicted_2025 = mean(predicted_total_ordered_2025, na.rm = TRUE),
+    avg_2024_orders = mean(total_ordered_2023, na.rm = TRUE),  # now 2024 due to shift
+    avg_age = mean(customer_age, na.rm = TRUE),
+    percent_LMP = mean(LOCAL_MARKET_PARTNER == "TRUE", na.rm = TRUE),
+    percent_CO2 = mean(CO2_CUSTOMER == "TRUE", na.rm = TRUE),
+    avg_propCases = mean(propCases, na.rm = TRUE),
+    avg_distance_to_centroid = mean(distance_to_centroid, na.rm = TRUE),
+    avg_percentChangeYOY = mean(percentChangeYOY, na.rm = TRUE)
+  )
+
+top_25pct_at_risk |>
+    summarise(
+    avg_predicted_2025 = mean(predicted_total_ordered_2025, na.rm = TRUE),
+    avg_2024_orders = mean(total_ordered_2023, na.rm = TRUE),  # now 2024 due to shift
+    avg_age = mean(customer_age, na.rm = TRUE),
+    percent_LMP = mean(LOCAL_MARKET_PARTNER == "TRUE", na.rm = TRUE),
+    percent_CO2 = mean(CO2_CUSTOMER == "TRUE", na.rm = TRUE),
+    avg_propCases = mean(propCases, na.rm = TRUE),
+    avg_distance_to_centroid = mean(distance_to_centroid, na.rm = TRUE),
+    avg_percentChangeYOY = mean(percentChangeYOY, na.rm = TRUE)
+  )
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# retialer aggregated mlm
+
+# Load Orignal Data
+```{r}
+CustomerProfileData <- read.csv("/Users/u0847758/Desktop/CAP/customer_profile.csv")  
+TransactionalData <- read.csv("/Users/u0847758/Desktop/CAP/transactional_data (1).csv")
+AddressZipData <- read.csv("/Users/u0847758/Desktop/CAP/customer_address_and_zip_mapping.csv")
+DeliveryCostData <- read_excel("/Users/u0847758/Desktop/CAP/delivery_cost_data (1).xlsx")
+```
+
+# First Round Cleaning
+
+## Clean Address Data
+
+## Address Data Cleaning
+* break address data into seperate columns
+* change lat and long to numeric
+```{r}
+#clean the address data
+# Split the column
+AddressZipData <- AddressZipData |>
+  separate(full.address, into = c("ZIP", "City", "State Name", "State Short", 
+                                  "County","Code", "Latitude", "Longitude"), sep = ",")
+
+AddressZipData$Latitude <- as.numeric(AddressZipData$Latitude)
+
+AddressZipData$Longitude <- as.numeric(AddressZipData$Longitude)
+```
+
+## Transactional Data Cleaning
+
+```{r}
+TransactionalData$TRANSACTION_DATE <- mdy(TransactionalData$TRANSACTION_DATE)
+  
+TransactionalData <- TransactionalData %>% 
+  mutate(Quarter_column = quarter(TRANSACTION_DATE), 
+         Quarter_year = paste(Quarter_column, YEAR, sep = " "),
+         MONTH = month(TRANSACTION_DATE)) %>% 
+  select(-c(LOADED_CASES, DELIVERED_CASES, LOADED_GALLONS, DELIVERED_GALLONS))
+```
+
+## Customer Profile Data Cleaning
+
+* Added Entity ID to look at customers with outlet all together
+* clean date format
+* convert character columns to factors
+* convert logical columns to 0/1 - for easier modeling later
+* filter out the one customer that has a first delivery date before they were on boarded
+```{r}
+#clean Customer Profile Data
+  CustomerProfileData <-  CustomerProfileData %>% 
+  mutate(
+    Entity_ID = case_when(
+      is.na(PRIMARY_GROUP_NUMBER) ~ CUSTOMER_NUMBER,  # If PRIMARY_GROUP_NUMBER is NA, use CUSTOMER_NUMBER
+      TRUE ~ PRIMARY_GROUP_NUMBER),
+    ON_BOARDING_DATE = mdy(ON_BOARDING_DATE),
+    FIRST_DELIVERY_DATE = mdy(FIRST_DELIVERY_DATE),
+    ON_BOARDING_YEAR = year(ON_BOARDING_DATE),
+    FIRST_DELIVERY_YEAR = year(FIRST_DELIVERY_DATE))
+
+char_col <- sapply(CustomerProfileData, is.character)
+CustomerProfileData[char_col] <- lapply(CustomerProfileData[char_col], as.factor)
+
+logical_cols <- sapply(CustomerProfileData, is.logical)
+CustomerProfileData[logical_cols] <- lapply(CustomerProfileData[logical_cols], as.numeric)
+
+#remove the customer where their on_boarding date was first delivery date was before the onboarding date (1 customer)
+CustomerProfileData <- CustomerProfileData %>% 
+  filter(FIRST_DELIVERY_DATE>=ON_BOARDING_DATE)
+```
+
+
+## Annual Aggregated Transactionl Data
+
+```{r}
+#Pivot wide the cost data
+#aggregated  transaction data to join to customer table
+
+# aggregate transaction data by customer_number and year
+#sum the ordered cases and gallons by customer number and year
+#this table is set up so each customer number has  two rows, one for 2023, one for 2024. Each column is sum of ordered cases/loaded cases. delivered cases in that year 
+aggregated_cost <- TransactionalData |>
+  group_by(CUSTOMER_NUMBER, YEAR) |>
+  summarize(orderedCases = sum(ORDERED_CASES),
+            orderedGallons = sum(ORDERED_GALLONS))
+
+
+
+#The code pivots the database above to have one row per customer and a column for each cases/gallons ordered for each year
+aggregated_cost_wide <- aggregated_cost |>
+  pivot_wider(
+    names_from = YEAR, 
+    values_from = c(orderedCases, 
+                    orderedGallons),
+    names_sep = "_"
+  )
+```
+
+
+## Location Clustering
+
+```{r}
+CustomerProfile_Location <- CustomerProfileData %>% 
+  left_join(AddressZipData, by = c("ZIP_CODE"="zip")) 
+```
+
+* do KMeans clustering to identify the four main location clusters
+* identify the center (Centroid) of each of the four main clusters
+```{r}
+#cluster the addresses and calculate the centroid for each cluster
+##Multiple centroids
+set.seed(123)
+
+kmeans_result <- kmeans(CustomerProfile_Location[,c("Longitude", "Latitude")], centers = 4)
+
+CustomerProfile_Location$cluster <- as.factor(kmeans_result$cluster)
+
+
+centroids <- CustomerProfile_Location %>% 
+  group_by(cluster) %>% 
+  summarize(centroid_lon = mean(Longitude), centroid_lat = mean(Latitude))
+
+```
+
+
+* Calculate the miles distance of each customers location to the centroid
+```{r}
+
+haversine_distance <- function(lon1, lat1, lon2, lat2) {
+  distHaversine(c(lon1, lat1), c(lon2,lat2))/1609.34 
+}# converts meters to miles
+
+#Join main customer data to the clusters created above
+CustomerProfile_Location <- CustomerProfile_Location %>% 
+  left_join(centroids, by = "cluster")
+
+
+CustomerProfile_Location <- CustomerProfile_Location %>% 
+  mutate(
+    distance_to_centroid = mapply(haversine_distance, CustomerProfile_Location$Longitude, CustomerProfile_Location$Latitude, CustomerProfile_Location$centroid_lon, CustomerProfile_Location$centroid_lat)
+  )
+
+```
+
+
+# Annual Customer No Retailer
+```{r}
+Annual_Customer_No_Retailer <- CustomerProfile_Location %>% 
+  left_join(aggregated_cost_wide, by = "CUSTOMER_NUMBER") %>% 
+  mutate(across(c(orderedCases_2023, orderedCases_2024, orderedGallons_2023, orderedGallons_2024), ~ replace_na(.x, 0)),
+         total_ordered = (orderedCases_2024 + orderedGallons_2024 +orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2023 = (orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2024 = (orderedCases_2024 + orderedGallons_2024)) %>% 
+  filter(!(year(FIRST_DELIVERY_DATE) == 2023 & orderedCases_2023 == 0 & orderedGallons_2023 == 0) &
+    !(year(FIRST_DELIVERY_DATE) == 2024 & orderedCases_2024 == 0 & orderedGallons_2024 == 0)) %>% 
+  filter(!(total_ordered_2023 ==0 & total_ordered_2024 == 0))
+
+Annual_Customer_No_Retailer <-  Annual_Customer_No_Retailer |>
+  filter(is.na(PRIMARY_GROUP_NUMBER))
+# filtering out the retail customers here
+
+
+
+```
+
+
+```{r}
+Annual_Customer_No_Retailer <- Annual_Customer_No_Retailer %>% 
+  group_by(Entity_ID) %>% 
+  summarize(FREQUENT_ORDER_TYPE = FREQUENT_ORDER_TYPE[which.max(tabulate(match(FREQUENT_ORDER_TYPE, unique(FREQUENT_ORDER_TYPE))))],
+            COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+            TRADE_CHANNEL = first(TRADE_CHANNEL),
+            SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+            FIRST_DELIVERY_DATE = min(FIRST_DELIVERY_DATE),
+            FIRST_DELIVERY_YEAR = min(FIRST_DELIVERY_YEAR),
+            ON_BOARDING_DATE = min(ON_BOARDING_DATE),
+            ON_BOARDING_YEAR = min(ON_BOARDING_YEAR),
+            customer_age = as.numeric(format(Sys.Date(), "%Y")) - ON_BOARDING_YEAR,
+            #hasOutlets = case_when(is.na(PRIMARY_GROUP_NUMBER)~ 0,TRUE ~1), # i made a change here
+            LOCAL_MARKET_PARTNER = LOCAL_MARKET_PARTNER[which.max(tabulate(match(LOCAL_MARKET_PARTNER,unique(LOCAL_MARKET_PARTNER))))],
+            CO2_CUSTOMER =  CO2_CUSTOMER[which.max(tabulate(match(CO2_CUSTOMER, unique(CO2_CUSTOMER))))],
+            
+            hasOrderedCases = as.integer(mean(case_when((orderedCases_2023 + orderedCases_2024)>0 ~1, TRUE ~ 0))>0,1,TRUE~0),
+            
+            propCases = sum(orderedCases_2023, orderedCases_2024)/ sum(total_ordered),
+ 
+            zip_code =  first(ZIP), 
+            
+            city =  first(City),
+
+            state =   
+              first(`State Name`), 
+
+            region = first(cluster),
+             
+            distance_from_centroid = first(distance_to_centroid),
+
+            total_ordered_2023 = sum(total_ordered_2023),
+            total_ordered_2024 = sum(total_ordered_2024),
+            percentChangeYOY = ((total_ordered_2024) - (total_ordered_2023))/(total_ordered_2023)) %>% 
+  mutate(Binning_column = case_when(
+    (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY < 0.10 ~ "low volume low growth",
+         (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY > 0.10 ~ "low volume high growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY < 0.05 ~ "high volume low growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY > 0.05 ~ "high volume high growth",
+         (total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY > 0 ~ "transtionary growing ",
+         (total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY < 0 ~ "transitionary declining" ))
+
+```
+
+
+# Annual Customer Data Retailer
+```{r}
+Annual_Customer_Retailer <- CustomerProfile_Location %>% 
+  left_join(aggregated_cost_wide, by = "CUSTOMER_NUMBER") %>% 
+  mutate(across(c(orderedCases_2023, orderedCases_2024, orderedGallons_2023, orderedGallons_2024), ~ replace_na(.x, 0)),
+         total_ordered = (orderedCases_2024 + orderedGallons_2024 +orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2023 = (orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2024 = (orderedCases_2024 + orderedGallons_2024)) %>% 
+  filter(!(year(FIRST_DELIVERY_DATE) == 2023 & orderedCases_2023 == 0 & orderedGallons_2023 == 0) &
+    !(year(FIRST_DELIVERY_DATE) == 2024 & orderedCases_2024 == 0 & orderedGallons_2024 == 0))
+
+# Imogen update, filtering out the NA for primary group here, rather than filtering for more than one outlet 
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  filter(!is.na(PRIMARY_GROUP_NUMBER))
+
+
+```
+
+```{r}
+Annual_Customer_Retailer <- Annual_Customer_Retailer %>% 
+  group_by(Entity_ID) %>% 
+    mutate(across(c(orderedCases_2023, orderedCases_2024, orderedGallons_2023, orderedGallons_2024), ~ replace_na(.x, 0)),
+         total_ordered = (orderedCases_2024 + orderedGallons_2024 +orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2023 = (orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2024 = (orderedCases_2024 + orderedGallons_2024)) %>% 
+  group_by(Entity_ID) %>% 
+  summarize(FREQUENT_ORDER_TYPE = FREQUENT_ORDER_TYPE[which.max(tabulate(match(FREQUENT_ORDER_TYPE, unique(FREQUENT_ORDER_TYPE))))],
+            COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+            TRADE_CHANNEL = first(TRADE_CHANNEL),
+            SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+            FIRST_DELIVERY_DATE = min(FIRST_DELIVERY_DATE),
+            FIRST_DELIVERY_YEAR = min(FIRST_DELIVERY_YEAR),
+            ON_BOARDING_DATE = min(ON_BOARDING_DATE),
+            ON_BOARDING_YEAR = min(ON_BOARDING_YEAR),
+            customer_age = as.numeric(format(Sys.Date(), "%Y")) - ON_BOARDING_YEAR,
+            
+            LOCAL_MARKET_PARTNER = LOCAL_MARKET_PARTNER[which.max(tabulate(match(LOCAL_MARKET_PARTNER,unique(LOCAL_MARKET_PARTNER))))],
+            CO2_CUSTOMER =  CO2_CUSTOMER[which.max(tabulate(match(CO2_CUSTOMER, unique(CO2_CUSTOMER))))],
+            hasOutlet = first(case_when(is.na(PRIMARY_GROUP_NUMBER)~ 0,TRUE ~1)),
+           # numberOfOutlets = sum(case_when(is.na(PRIMARY_GROUP_NUMBER)~ 1,TRUE ~1)), 
+           # that code was not actually counting the number of distinct customer ids associated with an entity
+           numberOfOutlets = n_distinct(CUSTOMER_NUMBER), # this should corrent that
+            #wellPerformingOutlet = sum(case_when((orderedGallons_2023 + orderedCases_2023) >= 400 ~ 1, (orderedGallons_2024 + orderedCases_2024) >=400 ~ 1, TRUE ~ 0)),
+           # that line needed to be changed too, because we are grouping by entity ID and we want to know within the entity ID group what number of customers a part of the same primary group are well performing - just wanted to use distinct to be sure 
+           wellPerformingOutlet = n_distinct(CUSTOMER_NUMBER[(orderedCases_2023 + orderedGallons_2023 >= 400) |
+  (orderedCases_2024 + orderedGallons_2024 >= 400)]),
+            hasOrderedCases = as.integer(mean(case_when((orderedCases_2023 + orderedCases_2024)>0 ~1, TRUE ~ 0))>0,1,TRUE~0),
+            
+            propCases = sum(orderedCases_2023, orderedCases_2024)/ sum(total_ordered),
+            
+            GeoSpread = n_distinct(ZIP),
+            most_common_zip = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(ZIP),
+              ZIP[which.max(tabulate(match(ZIP, unique(ZIP))))]), 
+            largest_zip = if_else(
+              numberOfOutlets == 1,
+              first(ZIP),
+              ZIP[which.max(total_ordered)]
+            ),
+            
+            most_common_city = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(City),
+              City[which.max(tabulate(match(City, unique(City))))]), 
+            largest_city = if_else(
+              numberOfOutlets == 1,
+              first(City),
+              City[which.max(total_ordered)]
+            ),
+            
+            most_common_state = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(`State Name`),
+              `State Name`[which.max(tabulate(match(`State Name`, unique(`State Name`))))]), 
+            largest_state = if_else(
+              numberOfOutlets == 1,
+              first(`State Name`),
+              `State Name`[which.max(total_ordered)]
+            ),
+            
+            most_common_region = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(cluster),
+              cluster[which.max(tabulate(match(cluster, unique(cluster))))]), 
+            largest_region = if_else(
+              numberOfOutlets == 1,
+              first(cluster),
+              cluster[which.max(total_ordered)]
+            ),
+            
+            most_common_distance = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(distance_to_centroid),
+              distance_to_centroid[which.max(tabulate(match(distance_to_centroid, unique(distance_to_centroid))))]), 
+            
+            largest_distance = if_else(
+              numberOfOutlets == 1,
+              first(distance_to_centroid),
+              distance_to_centroid[which.max(total_ordered)]
+            ),
+            
+                        
+            avg_distance = if_else(
+              numberOfOutlets == 1,
+              first(distance_to_centroid),
+              mean(distance_to_centroid)
+            ),
+            total_ordered_2023 = sum(total_ordered_2023),
+            total_ordered_2024 = sum(total_ordered_2024),
+            percentChangeYOY = ((total_ordered_2024) - (total_ordered_2023))/(total_ordered_2023))%>% 
+  mutate(Binning_column = case_when(
+    (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY < 0.10 ~ "low volume low growth",
+         (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY > 0.10 ~ "low volume high growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY < 0.05 ~ "high volume low growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY > 0.05 ~ "high volume high growth",
+         (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY > 0 ~ "transtionary growing ",
+         (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY < 0 ~ "transitionary declining" )) 
+
+#%>% 
+  #filter(numberOfOutlets > 1) # commenting this out here as i filtered for where primary group is NA
+```
+
+
+
+#MLM FOUR:
+```{r}
+
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(percentChangeYOY = if_else(total_ordered_2023 == 0 & total_ordered_2024 == 0, 0, percentChangeYOY))
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(
+    total_ordered_2023_adj = ifelse(total_ordered_2023 == 0 & total_ordered_2024 > 0, 1, total_ordered_2023),
+    percentChangeYOY = (total_ordered_2024 - total_ordered_2023_adj) / total_ordered_2023_adj
+  )
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(
+    percentChangeYOY = ifelse(
+      total_ordered_2023 == 0 & total_ordered_2024 > 0,
+      log1p(total_ordered_2024),  # smooth log growth
+      percentChangeYOY            # leave everything else as-is
+    )
+  )
+
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(
+    percentChangeYOY = case_when(total_ordered_2023 == 0 & total_ordered_2024 == 0 ~ 0,TRUE ~ percentChangeYOY
+    )
+  )
+
+
+
+mlm_four <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    avg_distance + propCases + (1 | Binning_column),
+  data = Annual_Customer_Retailer
+)
+
+summary(mlm_four)
+
+ranef(mlm_four)$Binning_column
+
+
+
+
+```
+ 
+```{r}
+
+summary(mlm_four)
+performance::r2(mlm_four)
+
+ranef(mlm_four)$Binning_column %>% arrange(desc(`(Intercept)`))
+```
+```{r}
+# Get actuals and fitted values for MLM 4
+actuals_mlm4 <- Annual_Customer_Retailer$total_ordered_2024
+fitted_mlm4 <- fitted(mlm_four)
+
+# Calculate RMSE
+rmse_mlm4 <- sqrt(mean((actuals_mlm4 - fitted_mlm4)^2))
+
+# Get R² values
+marginal_r2_mlm4 <- r2(mlm_four)$R2_marginal
+conditional_r2_mlm4 <- r2(mlm_four)$R2_conditional
+
+# Get AIC
+aic_mlm4 <- AIC(mlm_four)
+
+# Print the metrics for MLM 4
+cat("RMSE for MLM 4: ", rmse_mlm4, "\n")
+cat("Marginal R² for MLM 4: ", marginal_r2_mlm4, "\n")
+cat("Conditional R² for MLM 4: ", conditional_r2_mlm4, "\n")
+cat("AIC for MLM 4: ", aic_mlm4, "\n")
+
+
+```
+ 
+ 
+ Key Observations:
+AIC:
+
+MLM 4 has a much lower AIC (22,385.41) than any other model (MLM 1, MLM 2, and MLM 3). This indicates that MLM 4 has the best overall fit with the data, considering the complexity of the model.
+
+However, it's important to note that AIC penalizes complexity, and MLM 4's much lower value may suggest it is less complex than the other models, but this doesn't automatically mean it's better—it depends on other metrics as well.
+
+Marginal R²:
+
+MLM 2 has the highest marginal R² (0.9632), meaning it explains the most variance using just the fixed effects (predictors).
+
+MLM 4 has a marginal R² of 0.8606, which is lower than MLM 2. This indicates that, while MLM 4 has a great overall fit (as indicated by its AIC), the fixed effects alone are not as strong in explaining the variance in the target variable compared to the other models.
+
+Conditional R²:
+
+MLM 3 has the highest conditional R² (0.9899), which means it explains the most variance when accounting for both fixed and random effects.
+
+MLM 4 has a conditional R² of 0.9202, which is lower than MLM 3. This suggests that MLM 4 does not explain as much of the variance when considering the group-level (random effect) variations, compared to MLM 3.
+
+RMSE:
+
+MLM 2 has the lowest RMSE (11,544.45), meaning it is the most accurate model when predicting individual outcomes.
+
+MLM 4 has the highest RMSE (14,941.88), suggesting that it performs worse in terms of predictive accuracy compared to the other models.
+
+Conclusion:
+MLM 4 has the best AIC score, indicating it is the most efficient model in terms of fitting the data while penalizing complexity. However, it has a lower Marginal and Conditional R² compared to MLM 1 and MLM 3, suggesting that it doesn't explain as much of the variance in the target variable.
+
+MLM 2 is the best in terms of marginal R² and RMSE, indicating it performs well with the fixed effects alone and offers the best predictive performance.
+
+MLM 3, despite having a similar AIC to MLM 1, has the highest Conditional R², meaning it provides the best overall fit when considering both fixed and random effects, and is likely the best model in terms of explaining the total variance.
+
+Recommendation:
+If you're optimizing for prediction accuracy, MLM 2 might be the best choice due to its low RMSE.
+
+If you're optimizing for understanding the total variance and group-level behavior, MLM 3 is likely the best option.
+
+MLM 4 may be worth considering for future iterations if you're seeking a simpler model with a lower AIC, but the higher RMSE indicates that it may not predict as accurately as the other models.
+ 
+ 
+Great point! Given that MLM 4 is built on aggregated data, this brings a different dynamic compared to the other models, which seem to be built on customer-level data. Let's go through some key considerations:
+
+1. Aggregated Data vs. Customer-Level Data
+Aggregating data (for example, by grouping customers into retail groups or segments) reduces the level of detail available. It combines multiple individual observations (customers) into a single observation (retail group or segment), which can result in the loss of variability that exists at the individual level. This can lead to overfitting or underfitting based on how much important within-group variation is captured.
+
+MLM 4, being based on aggregated data, focuses more on group-level patterns rather than individual-level behavior. This is great for understanding how different retail groups behave as a whole, but it might miss the nuances of individual customer behavior that could be important for predictions.
+
+2. Lower AIC in MLM 4
+The AIC in MLM 4 is much lower (22,385.41) compared to the other models (which have AICs in the 85,000-87,000 range). This could indicate that the aggregated model is simpler and more parsimonious, capturing the main structure in the data without overfitting to the noise present in the individual-level data.
+
+However, this lower AIC could also be a result of the reduced complexity of the data (since it’s aggregated), leading to fewer degrees of freedom and potentially less overfitting. It’s important to note that while a lower AIC is often a good thing, it could sometimes indicate that the model is missing some important variability by using aggregated data.
+
+3. RMSE Comparison
+RMSE for MLM 4 is higher (14,941.88) than the other models, suggesting that, even though it has a simpler structure, it doesn’t predict individual outcomes as well. This makes sense because the aggregated model is not able to capture individual-level fluctuations and nuances, leading to higher prediction error when compared to more granular models (MLM 1, 2, and 3).
+
+If individual-level predictions are important (for example, if you need to forecast specific customer behavior), MLM 4’s higher RMSE indicates it might not be the best choice for making those predictions.
+
+4. Marginal R² and Conditional R²
+The marginal R² and conditional R² for MLM 4 are both lower than those of MLM 3. This indicates that the aggregated model explains less of the variance in total orders, especially once you consider the random effects (group-level differences). This is expected because aggregated models may not capture the full range of individual variations and behaviors.
+
+The lower R² values further suggest that the individual-level variation is still important for explaining the outcome, and by aggregating, we lose some of that explanatory power.
+
+5. Model Purpose and Strategy
+MLM 4 is useful if you're interested in analyzing group-level patterns (e.g., how different retail groups behave overall) rather than predicting individual customer outcomes. For instance, it could be valuable in cases where you're looking to understand the performance of different retail segments and how group-level factors (like the binning column or retail group) impact overall performance, rather than predicting specific customer volumes.
+
+However, if your goal is to predict individual customer behavior (such as forecasting which customers will exceed 400 gallons in 2025), then MLM 4 may not be the best choice due to its higher RMSE and lower R² values.
+
+Summary:
+MLM 4 with aggregated data provides a simpler model with lower AIC, but it does so at the expense of predictive accuracy and variance explained.
+
+It’s a great option if you're more focused on understanding group-level patterns, but individual-level prediction accuracy suffers.
+
+Given the higher RMSE and lower R², if your goal is prediction, especially for specific customer-level insights, you might still prefer MLM 1, MLM 2, or MLM 3.
+
+However, MLM 4 could be valuable for making broader strategic decisions based on overall segment performance, especially if you’re prioritizing model simplicity and interpretability.
+
+Recommendation:
+If you’re focused on individual-level predictions, then MLM 4 might not be the ideal choice due to its higher RMSE. If, however, you are primarily interested in understanding group-level behavior or are dealing with large volumes of aggregated data, then MLM 4 could still offer valuable insights despite the lower individual prediction accuracy.
+
+
+so like should the insight to swire be, that they really should care about individual customer level performance at the retailer level, like they should not be so general to treat a retailer as a group, and a retailer that has a certain number of bad or good individual customers is more important?
+
+
+
+
+Yes, exactly! The insight to Swire should be that individual customer performance is crucial for understanding retailer-level outcomes, and treating a retailer as a group (i.e., aggregating data) could miss out on significant individual-level variations that can impact overall performance.
+
+Here’s how you can frame that insight:
+
+Key Insight for Swire:
+Importance of Individual-Level Data:
+
+Individual customer behavior matters more than we might think, even at the retailer level. For example, a retailer might have a high-level volume of orders, but if it has a mix of high- and low-performing customers, the group-level metrics could be misleading.
+
+A retailer with a high volume of low-performing customers (who are not ordering much) might still be at risk for stagnation or decline, even if its overall sales seem healthy.
+
+Conversely, a retailer with a few high-performing customers (even if there are fewer in number) might still show high growth potential, but aggregating these individual customer behaviors into group-level averages misses out on these signals.
+
+Why Aggregated Models Can Miss Key Signals:
+
+Aggregating data for retailers (like treating them as one unit) smooths over these individual differences, making it harder to capture the variation in customer performance within a retailer group. This reduces the model's ability to identify which customers are driving growth or which might be at risk.
+
+From the models you’ve built, it’s clear that individual-level insights (like which specific customers are growing or declining) explain much of the variation in retailer performance. This means that looking at customer-level behavior is crucial for accurate prediction and strategic decision-making.
+
+Strategic Focus on Retailer Segmentation Based on Individual Behavior:
+
+Swire should consider focusing on retailer-level strategies that are more nuanced, based on individual customer performance. This means not treating every retailer as a monolith and instead understanding the specific mix of customers within each retailer group.
+
+For example, if a retailer’s total volume is high but many of its customers are stagnant or declining, this retailer might need proactive intervention to avoid potential losses in the future. On the other hand, if a retailer is showing high growth among specific customers, Swire might want to double down on these high performers with targeted promotions or resources.
+
+Tailoring Strategies by Retailer Group and Customer Performance:
+
+The key takeaway is that retailers are made up of different types of customers. Some are growing, some are declining, and some are stable. Swire could benefit from treating each retailer as a portfolio of customers and tailoring engagement strategies accordingly.
+
+For example, retailers with "transitionary growing" customers might be ripe for cross-sell opportunities or product expansion, while retailers with "transitionary declining" customers may need retention efforts or even a review of their offerings.
+
+Conclusion:
+Rather than focusing solely on retailer-level averages, Swire should prioritize individual customer performance to predict future sales more accurately. By understanding which customers within a retailer are driving growth or stagnation, they can apply more targeted, actionable strategies that go beyond simply looking at aggregate retailer data.
+
+So yes, Swire should definitely care about individual customer performance, as it will give them much more granular insights to make informed decisions at the retailer level.
+
+
+
+cool! i want to use my mlm 3 model to like look at what primary groups had the highest amount of customers move across 400, i think it would also be good to see like within retailers what are average reatil sizes, what does "good" retail perfomance look like? like if i am reccomending to go from individual customer level can we give a new reccomendation based on the mlm 3 model of waht to look out for, and maybe see like how many good customers in a retailer they should look out for things like that? 
+
+
+
+```{r}
+# Create a binary indicator for customers crossing 400 in 2024
+
+
+# Group by primary group number to see how many customers crossed 400
+primary_group_movement <- retailer_set %>%
+  group_by(PRIMARY_GROUP_NUMBER) %>%
+  summarise(
+    count_2024 = sum(crossed_400_2024),
+    count_2025_predicted = sum(predicted_grow_2025),
+    .groups = "drop"
+  )
+
+# View top primary groups with the highest movement
+primary_group_movement %>%
+  arrange(desc(count_2025_predicted)) %>%
+  head(10)
+
+```
+
+ 

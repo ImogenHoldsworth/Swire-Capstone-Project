@@ -1,0 +1,2329 @@
+---
+title: "Presentation Modeling"
+author: "Imogen Holdsworth"
+date: "2025-03-29"
+output: html_document
+---
+
+```{r}
+pacman::p_load(tidyverse, scales, dplyr, corrr, janitor, tidyr, psych, readr, lubridate, rpart, rpart.plot, caret, C50, sf, maps, dbscan, geosphere, nnet, randomForest,readxl,Metrics,pROC,lme4 )
+```
+
+# Data Load for MLM
+```{r}
+CustomerProfileData <- read.csv("/Users/u0847758/Desktop/CAP/customer_profile.csv")  
+TransactionalData <- read.csv("/Users/u0847758/Desktop/CAP/transactional_data (1).csv")
+AddressZipData <- read.csv("/Users/u0847758/Desktop/CAP/customer_address_and_zip_mapping.csv")
+DeliveryCostData <- read_excel("/Users/u0847758/Desktop/CAP/delivery_cost_data (1).xlsx")
+```
+
+
+```{r}
+#clean the address data
+# Split the column
+AddressZipData <- AddressZipData |>
+  separate(full.address, into = c("ZIP", "City", "State Name", "State Short", 
+                                  "County","Code", "Latitude", "Longitude"), sep = ",")
+
+AddressZipData$Latitude <- as.numeric(AddressZipData$Latitude)
+
+AddressZipData$Longitude <- as.numeric(AddressZipData$Longitude)
+```
+
+```{r}
+
+# Make sure transaction date is a date
+TransactionalData <- TransactionalData |>
+  mutate(TRANSACTION_DATE = as.Date(TRANSACTION_DATE))
+
+# Create total volume (gallons + cases)
+TransactionalData <- TransactionalData |>
+  mutate(
+    total_volume = ORDERED_GALLONS + ORDERED_CASES,
+    total_delivered = DELIVERED_GALLONS + DELIVERED_CASES,
+    prop_delivered = total_delivered/total_volume)
+
+# Aggregate by customer_id and year
+annual_volumes <- TransactionalData |>
+  group_by(CUSTOMER_NUMBER, YEAR) |>
+  summarise(
+    total_gallons = sum(ORDERED_GALLONS),
+    total_cases = sum(ORDERED_CASES),
+    total_volume = sum(total_volume),
+    total_delivered = sum(total_delivered),
+    prop_delivered = total_delivered/total_volume,
+    .groups = "drop")
+
+head(annual_volumes)
+
+volumes_wide <- annual_volumes |>
+  pivot_wider(
+    names_from = YEAR,
+    values_from = c(total_gallons, total_cases, total_volume, total_delivered, prop_delivered),
+    names_glue = "{.value}_{YEAR}"
+  )
+
+glimpse(volumes_wide)
+```
+
+join to profile 
+```{r}
+
+customer_full <- volumes_wide |>
+  left_join(CustomerProfileData, by = "CUSTOMER_NUMBER")
+
+```
+
+
+```{r}
+CustomerProfile_Location <- CustomerProfileData %>% 
+  left_join(AddressZipData, by = c("ZIP_CODE"="zip")) 
+
+```
+
+* do KMeans clustering to identify the four main location clusters
+* identify the center (Centroid) of each of the four main clusters
+```{r}
+#cluster the addresses and calculate the centroid for each cluster
+##Multiple centroids
+set.seed(123)
+
+kmeans_result <- kmeans(CustomerProfile_Location[,c("Longitude", "Latitude")], centers = 4)
+
+CustomerProfile_Location$cluster <- as.factor(kmeans_result$cluster)
+
+
+centroids <- CustomerProfile_Location %>% 
+  group_by(cluster) %>% 
+  summarize(centroid_lon = mean(Longitude), centroid_lat = mean(Latitude))
+
+haversine_distance <- function(lon1, lat1, lon2, lat2) {
+  distHaversine(c(lon1, lat1), c(lon2,lat2))/1609.34 
+}# converts meters to miles
+
+#Join main customer data to the clusters created above
+CustomerProfile_Location <- CustomerProfile_Location %>% 
+  left_join(centroids, by = "cluster")
+
+
+CustomerProfile_Location <- CustomerProfile_Location %>% 
+  mutate(
+    distance_to_centroid = mapply(haversine_distance, CustomerProfile_Location$Longitude, CustomerProfile_Location$Latitude, CustomerProfile_Location$centroid_lon, CustomerProfile_Location$centroid_lat)
+  )
+
+str(customer_full$CUSTOMER_NUMBER)
+str(CustomerProfile_Location$CUSTOMER_NUMBER)
+
+cluster_info <- CustomerProfile_Location |>
+  select(CUSTOMER_NUMBER, cluster, distance_to_centroid)
+
+customer_full <- customer_full |>
+  left_join(cluster_info, by = "CUSTOMER_NUMBER")
+
+
+
+```
+
+
+
+I want to use multi level modeling and understand the impact being a retailer vs not has as well as LMP status, Co2, clusters things like that. 
+
+I needed to start first with a larger data source, that is the customer level, order totals for 23 and 24, with parent indicators, but not summated at the parent level, 
+
+now i need to create two columns, part of outlet, and size of retialer to use in mlm
+
+```{r}
+customer_full <- customer_full |>
+  mutate(
+    LOCAL_MARKET_PARTNER = as.factor(LOCAL_MARKET_PARTNER),
+    CO2_CUSTOMER = as.factor(CO2_CUSTOMER)
+  )
+
+# add retailer size to customer level data 
+group_size <- customer_full |>
+  filter(!is.na(PRIMARY_GROUP_NUMBER)) |>
+  group_by(PRIMARY_GROUP_NUMBER) |>
+  summarise(retailer_size = n_distinct(CUSTOMER_NUMBER), .groups = "drop")
+
+
+
+customer_full <- customer_full |>
+  left_join(group_size, by = "PRIMARY_GROUP_NUMBER") |>
+  mutate(
+    is_retailer = if_else(!is.na(PRIMARY_GROUP_NUMBER), 1, 0)
+  )
+
+
+```
+
+
+```{r}
+
+customer_full |>
+  mutate(
+    missing_2023 = is.na(total_volume_2023),
+    missing_2024 = is.na(total_volume_2024)
+  ) %>%
+  count(missing_2023, missing_2024)
+
+
+customer_full <- customer_full |>
+  mutate(
+    total_volume_2023 = replace_na(total_volume_2023, 0),
+    total_volume_2024 = replace_na(total_volume_2024, 0),
+    total_gallons_2023 = replace_na(total_gallons_2023, 0),
+    total_gallons_2024 = replace_na(total_gallons_2024, 0),
+    total_cases_2023 = replace_na(total_cases_2023, 0),
+    total_cases_2024 = replace_na(total_cases_2024, 0),
+    total_delivered_2023 = replace_na(total_delivered_2023, 0),
+    total_delivered_2024 = replace_na(total_delivered_2024, 0),
+    prop_delivered_2023 = ifelse(total_volume_2023 == 0, 0, total_delivered_2023 / total_volume_2023),
+    prop_delivered_2024 = ifelse(total_volume_2024 == 0, 0, total_delivered_2024 / total_volume_2024),
+    volume_change = total_volume_2024 - total_volume_2023
+  )
+
+
+
+
+summary(customer_full$volume_change)
+hist(customer_full$volume_change, breaks = 50)
+
+colSums(is.na(customer_full))
+
+colnames(customer_full)
+
+
+customer_full <- customer_full |>
+  mutate(
+    propCases = (total_cases_2023 + total_cases_2024) / 
+                (total_cases_2023 + total_cases_2024 + total_gallons_2023 + total_gallons_2024),
+    hasOrderedCases = if_else(total_cases_2023 > 0 | total_cases_2024 > 0, 1, 0)
+  )
+
+customer_full <- customer_full |>
+  mutate(
+    total_ordered_2023 = total_volume_2023 ,
+    total_ordered_2024 = total_volume_2024,
+    percentChangeYOY = (volume_change) / total_ordered_2023)
+
+
+# some customers a part of retailers have weird situations where order amounts are 0 
+customer_full <- customer_full |>
+  mutate(percentChangeYOY = if_else(total_ordered_2023 == 0 & total_ordered_2024 == 0, 0, percentChangeYOY))
+
+str(customer_full)
+
+# fixing YoY infinite issues. 
+
+customer_full <- customer_full |>
+  mutate(
+    total_ordered_2023_adj = ifelse(total_ordered_2023 == 0 & total_ordered_2024 > 0, 1, total_ordered_2023),
+    percentChangeYOY = (total_ordered_2024 - total_ordered_2023_adj) / total_ordered_2023_adj
+  )
+
+# fixing the issue for customers who were on boarded in 23 and 24 and are showing super high YoY values 
+
+# using smoothed percentage change maybe should have explored a log diff order value instead of YoY change but oh well. 
+
+customer_full <- customer_full |>
+  mutate(
+    percentChangeYOY = ifelse(
+      total_ordered_2023 == 0 & total_ordered_2024 > 0,
+      log1p(total_ordered_2024),  # smooth log growth
+      percentChangeYOY            # leave everything else as-is
+    )
+  )
+
+
+customer_full <- customer_full |>
+  mutate(
+    percentChangeYOY = case_when(total_ordered_2023 == 0 & total_ordered_2024 == 0 ~ 0,TRUE ~ percentChangeYOY
+    )
+  )
+
+
+customer_full <- customer_full |>
+  mutate(
+    Binning_column = case_when(
+      total_ordered_2023 < 400 & total_ordered_2024 < 400 & percentChangeYOY <= 0.10 ~ "low volume low growth",
+      total_ordered_2023 < 400 & total_ordered_2024 < 400 & percentChangeYOY > 0.10 ~ "low volume high growth",
+      total_ordered_2023 > 400 & total_ordered_2024 > 400 & percentChangeYOY < 0.05 ~ "high volume low growth",
+      total_ordered_2023 > 400 & total_ordered_2024 > 400 & percentChangeYOY > 0.05 ~ "high volume high growth",
+      (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY >= 0 ~ "transitionary growing",
+      (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY < 0 ~ "transitionary declining",
+      TRUE ~ "unclassified"
+    )
+  )
+
+customer_full <- customer_full |>
+  mutate(ON_BOARDING_DATE = as.Date(ON_BOARDING_DATE))
+
+customer_full <- customer_full |>
+  mutate(customer_age = as.numeric(format(Sys.Date(), "%Y")) - as.numeric(format(ON_BOARDING_DATE, "%Y")))
+
+
+
+
+# set retailer and non retailer data. 
+
+retailer_set <- customer_full |>
+  filter(is_retailer == 1 | !is.na(PRIMARY_GROUP_NUMBER))
+
+non_retailer_set <- customer_full |>
+  filter(is_retailer == 0 & is.na(PRIMARY_GROUP_NUMBER))
+
+colnames(retailer_set)
+
+
+
+
+
+```
+
+# HERE 4/4/25
+
+```{r}
+# linear mlm one
+
+str(retailer_set)
+
+
+retailer_set <- retailer_set |>
+  mutate(
+    PRIMARY_GROUP_NUMBER = as.factor(PRIMARY_GROUP_NUMBER),
+    FREQUENT_ORDER_TYPE = as.factor(FREQUENT_ORDER_TYPE),
+    Binning_column = as.factor(Binning_column),
+    LOCAL_MARKET_PARTNER = as.factor(LOCAL_MARKET_PARTNER),
+    CO2_CUSTOMER = as.factor(CO2_CUSTOMER),
+    cluster = as.factor(cluster)
+  )
+
+
+mlm_one <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER +  percentChangeYOY + distance_to_centroid + propCases +
+    (1 | PRIMARY_GROUP_NUMBER), 
+  data = retailer_set
+)
+
+
+summary(mlm_one)
+install.packages("performance")
+library(performance)
+
+summary(mlm_one)
+r2(mlm_one)
+
+ranef(mlm_primary_group)$PRIMARY_GROUP_NUMBER %>% head()
+
+
+
+
+```
+Goal: Predict total orders in 2024 based on 2023 behavior + customer features, adjusting for differences across retailer groups (Primary Group Number).
+
+
+Marginal R² (Fixed Effects only): 0.879
+→ This means the fixed effects (like total_ordered_2023, CO2_CUSTOMER, etc.) alone explain ~88% of the variation in 2024 orders.
+
+Conditional R² (Fixed + Random Effects): 0.989
+→ When you include differences between retail groups, you explain ~99% of the variation.
+✅ This means retail group membership really matters — you're modeling group-level patterns successfully.
+
+
+
+
+Predictor	Interpretation
+total_ordered_2023	✅ Very strong (t = 510!) – more in 2023 → more in 2024.
+percentChangeYOY	✅ Higher YoY change → growth continues.
+CO2_CUSTOMERTRUE	✅ Positive impact (adds ~112 units on avg).
+LOCAL_MARKET_PARTNERTRUE	✅ Significant positive effect (adds ~203 units).
+Order Type	❌ Not significant here — coefficients vary but none are strong.
+customer_age, distance_to_centroid, propCases	❌ No significant effect.
+
+
+Your random intercepts (like ranef(mlm_one)$PRIMARY_GROUP_NUMBER) show how each retailer group deviates from the average expected 2024 volume after adjusting for customer behavior. For example:
+
+So: Group 21 performs ~387 units above average on top of the expected volume from fixed effects.
+
+
+
+```{r}
+# mlm two only using binning 
+
+
+mlm_two <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases + 
+    (1 | Binning_column),
+  data = retailer_set
+)
+
+summary(mlm_two)
+r2(mlm_two)
+
+ranef(mlm_two)$Binning_column %>% head()
+
+
+
+```
+
+
+Model: mlm_two
+Random effect: Binning_column
+
+Data used: retailer_set
+
+Target: total_ordered_2024
+
+
+
+Interpretation:
+🔁 Random Effects
+The variance from Binning_column (442.7) is much smaller than the residual variance (1,527).
+
+That suggests the binning groups (like "high volume low growth", etc.) explain a small amount of the variation in total orders after controlling for the fixed effects.
+
+So yes, binning has some effect, but it’s much less impactful than PRIMARY_GROUP_NUMBER was in your previous model.
+
+📌 Fixed Effects:
+total_ordered_2023 remains the most dominant predictor — just like we saw earlier.
+
+percentChangeYOY is highly significant and positive again ✅
+
+LOCAL_MARKET_PARTNER is marginally significant.
+
+All other variables (frequent order type, CO2, etc.) are not significant in this model.
+
+
+Comparing to Step 1 (Primary Group Model):
+mlm_primary_group	mlm_two (binning only)
+Conditional R²	0.989	0.966
+Marginal R²	0.879	0.963
+AIC (REML criterion)	85,017.9	87,307
+Residual Std. Dev.	939.4	1,527
+Random Effect Group	Primary Group	Binning Column
+Random Effect Variance	2.98M	~196K
+
+
+Conclusion so far:
+mlm_primary_1 is the better model. It explains more variation and fits better by AIC.
+
+
+
+Binning Group	Random Intercept	Interpretation
+transitionary growing	+488.99	🚀 Above average — even after accounting for prior volume, age, CO2, LMP, etc., this group orders more than expected in 2024. These are strong upward movers.
+high volume high growth	+439.73	✅ Still very strong. These groups are maintaining high performance and even exceeding expectations.
+low volume low growth	+68.33	🔹 Slightly better than expected — not growing fast, but not underperforming.
+low volume high growth	+10.69	🟰 Near average — growth is happening but not drastically beyond what you'd predict from other factors.
+transitionary declining	−437.18	🛑 Way below expectations — this group is dropping off even more than what prior volume or other predictors would suggest.
+high volume low growth	−570.56	⚠️ Underwhelming performance — these groups had high volume, but their lack of growth is worse than expected after controlling for other drivers.
+
+
+
+
+
+
+Top Targets: transitionary growing groups — they’re heating up even more than expected. These could be ripe for cross-sell, new products, route expansion, etc.
+
+Strategic Concerns: high volume low growth groups — may need proactive engagement. These are high-value accounts at risk of stagnation.
+
+Tail Strategy: transitionary declining groups — investigate why they’re underperforming so sharply. Competitor? Operational issue?
+
+
+
+
+
+
+
+
+
+```{r}
+# mlm three! 
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases  +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+
+summary(mlm_three)
+performance::r2(mlm_three)
+
+
+ranef(mlm_three)$PRIMARY_GROUP_NUMBER %>% head()
+ranef(mlm_three)$Binning_column %>% arrange(desc(`(Intercept)`))
+
+
+install.packages("lmerTest")  # only needed once
+library(lmerTest)
+
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases  +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+
+summary(mlm_three)
+
+```
+Conditional R² (0.990): The model explains 99% of the total variation in 2024 orders including group-level effects. Excellent fit.
+
+Marginal R² (0.879): The fixed effects alone explain ~88% of the variation — strong performance.
+
+REML Criterion (84665.3): Lower than previous MLMs, suggesting a better overall model (though we’ll finalize that once RMSE is added).
+
+
+
+
+
+
+ Key Fixed Effects
+Predictor	Estimate	Significance	Interpretation
+total_ordered_2023	+1.16	***	The strongest predictor. Baseline volume drives future growth.
+CO2_CUSTOMERTRUE	+120	**	CO2 customers order more in 2024.
+LOCAL_MARKET_PARTNERTRUE	+156	**	LMP customers order more in 2024.
+percentChangeYOY	+74	***	High YoY growth in % is strongly linked to 2024 ordering.
+Other order types	Small or non-sig	Little added predictive value in this version.
+
+
+
+Group	Std. Dev.	What it tells us
+PRIMARY_GROUP_NUMBER	2954	Large variation across retailer groups — supports earlier findings.
+Binning_column	396.5	Still meaningful variation across bins, but smaller than between retailer groups.
+Residual	900.2	Most remaining noise is at the individual customer level.
+
+
+
+Interpretation of Random Intercepts (Binning_column)
+These intercepts show how much each customer segment (based on past performance) deviates from the global average in their expected 2024 ordering, after accounting for all fixed effects like volume, CO2, LMP, etc.
+
+Binning Group	Intercept	Meaning
+🟢 Transitionary Growing	+442.6	These customers are rapidly ramping up — the model expects them to significantly outperform their peers.
+🟢 High Volume High Growth	+335.6	These are reliable high performers — strong past + continued growth.
+🟡 Low Volume Low Growth	+89.1	Small positive lift — these are stable but low-output accounts.
+🟡 Low Volume High Growth	+67.0	Model sees some growth potential, but not dramatically high. Possibly constrained by size.
+🔴 Transitionary Declining	-379.9	These accounts are slipping — strong prior performance, but dropping off. Model expects underperformance.
+🔴 High Volume Low Growth	-554.5	🚨 These are your most concerning group — large but stagnating. Highest potential for intervention or reactivation efforts.
+🧭 Strategic Implication
+This random effect structure confirms that customer segments explain meaningful variation, even after controlling for all other known predictors. The model is telling you:
+
+"If you tell me a customer's bin (like 'transitionary growing'), I can better predict their performance."
+
+So including Binning_column helps capture latent behavioral patterns — exactly what you hypothesized earlier.
+
+
+
+How to Interpret These Group Intercepts
+Each value represents how much a given retail group (e.g., group 17, 19, etc.) deviates from the global average prediction, after accounting for:
+
+2023 order volume
+
+CO2 / LMP / age / channel
+
+Growth % (percentChangeYoY)
+
+And the effects of the Binning_column
+
+Group ID	Random Intercept	Meaning
+167	+497.3	📈 Strong-performing retailer group — customers here consistently order more than expected.
+21	+315.4	📈 Another outperforming group — possible reliable performer.
+19	+191.0	👍 Still above average, but less extreme.
+104	+218.6	👍 Also outperforming.
+251	+239.6	✅ Solid performer.
+17	+256.8	✅ Another strong retail group.
+🧭 Strategic Takeaways for Swire
+These retailer group effects capture unobserved patterns — maybe sales culture, regional practices, or management that you didn’t include explicitly.
+
+High intercept + underwhelming performance = 🔥 group to target (they should be doing better).
+
+Low intercept + strong performance = 🚨 unexpected overperformance — worth digging into what they’re doing right.
+
+This is precisely why multi-level modeling shines: it quantifies both individual-level and group-level contributions to growth, helping you target both customer and group strategies.
+
+
+
+
+
+```{r}
+# compare models performance 
+
+library(performance)
+library(yardstick)
+library(dplyr)
+library(tibble)
+
+# Get model fits
+fitted_pg   <- fitted(mlm_one)
+fitted_bin  <- fitted(mlm_two)
+fitted_both <- fitted(mlm_three)
+
+# Get actuals (same across all models)
+actuals <- retailer_set$total_ordered_2024
+
+# Calculate RMSE manually for each model
+rmse_pg   <- sqrt(mean((actuals - fitted_pg)^2))
+rmse_bin  <- sqrt(mean((actuals - fitted_bin)^2))
+rmse_both <- sqrt(mean((actuals - fitted_both)^2))
+
+# Create comparison table
+model_comparison <- tribble(
+  ~model,                       ~AIC,                  ~marginal_R2,                 ~conditional_R2,               ~RMSE,
+  "MLM 1: Primary Group",       AIC(mlm_one),          r2(mlm_one)$R2_marginal,      r2(mlm_one)$R2_conditional,    rmse_pg,
+  "MLM 2: Binning Column",      AIC(mlm_two),          r2(mlm_two)$R2_marginal,      r2(mlm_two)$R2_conditional,    rmse_bin,
+  "MLM 3: Both Random Effects", AIC(mlm_three),        r2(mlm_three)$R2_marginal,    r2(mlm_three)$R2_conditional,  rmse_both
+)
+
+# View it
+model_comparison
+
+```
+
+Metric	What it tells you
+AIC	Akaike Information Criterion — lower = better model fit with a penalty for complexity
+marginal_R2	R² for fixed effects only — how much variance is explained by your predictors
+conditional_R2	R² for fixed + random effects — total variance explained by the full model
+RMSE	Root Mean Square Error — average prediction error in your outcome units; lower = better
+
+
+ Key Takeaways:
+🔸 MLM 3 (Both Random Effects):
+Has the lowest AIC, which suggests the best overall fit accounting for complexity.
+
+Has highest conditional R² → explains the most total variance.
+
+Marginal R² is similar to MLM 1, so it adds more value from the random effects.
+
+RMSE is a touch higher than MLM 2, but not dramatically.
+
+✅ Best overall model fit.
+
+🔸 MLM 2 (Binning Column only):
+Highest marginal R² (0.96!) → your fixed effects alone explain a huge portion of variance.
+
+But conditional R² is lower than MLM 1 and 3, so your random effects aren’t adding much.
+
+Lowest RMSE, so it makes slightly more accurate predictions on average.
+
+✅ Best model for fixed-effect explanatory power or predictive performance.
+
+🔸 MLM 1 (Primary Group only):
+Lower AIC than MLM 2 but higher than MLM 3.
+
+Marginal R² and conditional R² are solid — better than MLM 2 in total explained variance, worse than MLM 3.
+
+✅ Middle ground model.
+
+🔮 What to Do:
+If your goal is prediction, you might favor MLM 2 for the lowest RMSE.
+
+If your goal is explaining structure (especially accounting for hierarchical group effects), MLM 3 wins — great balance of fixed and random contributions.
+
+Use marginal vs conditional R² to gauge how much variance your random effects are adding.
+
+
+
+
+
+
+
+🧠 What This Tells You
+MLM 3 (Both Random Effects) has the best AIC and Conditional R², meaning it explains the most variance when group-level patterns are considered.
+
+MLM 2 (Binning Only) has best RMSE and Marginal R², meaning its fixed effects (especially growth bin behavior) are very strong on their own.
+
+MLM 1 (Primary Group Only) also performs well but isn’t the strongest in any single metric.
+
+
+“When accounting for both group-level retailer behavior and customer performance segments, our model achieves a Conditional R² of 0.99 and performs comparably in RMSE. This reinforces the importance of both macro-level (retailer) and behavioral (binning) variation.”
+
+
+## cross validation, 
+
+Totally fair — since you're using this model to simulate/predict 2025, it does make sense to run some form of cross-validation or holdout testing to give Swire (and yourself) confidence that your model:
+
+Generalizes well to new unseen data
+
+Isn’t just fitting noise in 2023 → 2024 behavior
+
+Can reasonably project performance into 2025
+
+
+
+Because your MLM uses PRIMARY_GROUP_NUMBER (retailer group) and Binning_column as random effects, you don’t want to randomly split rows — you want to split by group.
+
+Here’s the plan:
+Split your dataset by group, keeping all customers from a single retail group in either train or test.
+
+Train your MLM on the training groups.
+
+Predict on the held-out test groups and calculate RMSE.
+
+This simulates how your model might perform on totally new retail groups in 2025.
+
+```{r}
+
+
+# scale for model improvment
+
+retailer_set <- retailer_set |>
+  mutate(
+    total_ordered_2023_scaled = scale(total_ordered_2023)
+  )
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023_scaled + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+# cross validtation
+
+
+library(lme4)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(yardstick)
+library(performance)
+
+set.seed(123)  # Reproducibility
+
+# Fold assignment by retailer group
+group_folds <- retailer_set |>
+  distinct(PRIMARY_GROUP_NUMBER) |>
+  mutate(fold = sample(rep(1:5, length.out = n())))
+
+retailer_set_cv <- retailer_set |>
+  left_join(group_folds, by = "PRIMARY_GROUP_NUMBER")
+
+# Cross-validation loop
+cv_results <- map_df(1:5, function(fold_num) {
+  
+  # Train/test split
+  train_data <- retailer_set_cv |>
+    filter(fold != fold_num)
+  test_data  <- retailer_set_cv |>
+    filter(fold == fold_num)
+  
+  # Fit MLM
+  model <- lmer(
+    total_ordered_2024 ~ total_ordered_2023_scaled + FREQUENT_ORDER_TYPE +
+      LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY +
+      distance_to_centroid + propCases  +
+      (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+    data = train_data
+  )
+  
+  # Predict on test
+  preds <- predict(model, newdata = test_data, allow.new.levels = TRUE)
+  
+  # Calculate metrics
+  rmse_val <- rmse_vec(test_data$total_ordered_2024, preds)
+  r2_vals  <- performance::r2(model)
+  
+  tibble(
+    fold = fold_num,
+    rmse = rmse_val,
+    marginal_r2 = r2_vals$R2_marginal,
+    conditional_r2 = r2_vals$R2_conditional
+  )
+})
+
+# Summary across folds
+cv_results_summary <- cv_results |>
+  summarise(
+    mean_rmse = mean(rmse),
+    sd_rmse = sd(rmse),
+    mean_marginal_r2 = mean(marginal_r2),
+    mean_conditional_r2 = mean(conditional_r2)
+  )
+
+# View
+print(cv_results)
+print(cv_results_summary)
+
+```
+
+Interpretation
+RMSE (Root Mean Squared Error): Lower is better. Folds 1–3 are very tight and solid (under 1700), while folds 4 and 5 are higher — suggesting some variability in prediction accuracy depending on the fold (probably tied to differences in retailer group mix).
+
+Marginal R²: Shows how much variance is explained by fixed effects only. Fold 4 is a bit of an outlier here (0.729), but the rest are strong (0.85–0.97).
+
+Conditional R²: Reflects total variance explained including random effects — all folds are above 0.98, which is excellent and consistent.
+
+
+
+Compared to Before (Full Model):
+Your earlier full model (no CV) had:
+
+RMSE around 11,648
+
+Marginal R² ~0.879
+
+Conditional R² ~0.990
+
+So:
+
+Cross-validated performance is very strong, and actually more reassuring — most folds beat the full-model RMSE, and R² is consistently high.
+
+Variability in RMSE across folds is something to keep an eye on, but not a dealbreaker.
+
+
+## ready for predictions 
+
+
+
+well i used the 23 data to predict 24, now i want to use the same 24 data that already exists in my retailer mix to get 25, dont i need to like set 23 to 24 or something like  mutate(total_ordered_2023 = total_ordered_2024) %>% 
+  select(-total_ordered_2024)
+
+
+```{r}
+
+mlm_three <- lmer(
+  total_ordered_2024 ~ total_ordered_2023 + FREQUENT_ORDER_TYPE + 
+    LOCAL_MARKET_PARTNER + customer_age + CO2_CUSTOMER + percentChangeYOY + 
+    distance_to_centroid + propCases +
+    (1 | PRIMARY_GROUP_NUMBER) + (1 | Binning_column),
+  data = retailer_set
+)
+
+
+# Step 1: Create prediction set using 2024 as the new baseline
+predict_2025_data <- retailer_set |>
+  mutate(
+    total_ordered_2023 = total_ordered_2024,      # use 2024 as the new baseline
+    customer_age = customer_age + 1               # increment age
+  ) %>%
+  select(-total_ordered_2024)                      # drop old 2024 column to simulate 2025
+
+# Step 2: Predict 2025 using the best model
+predicted_2025 <- predict(mlm_three, newdata = predict_2025_data, allow.new.levels = TRUE)
+
+# Step 3: Attach predictions back to data
+predict_2025_data <- predict_2025_data %>%
+  mutate(predicted_total_ordered_2025 = predicted_2025)
+
+# ✅ Step 4: Recalculate percentChangeYoY now that we have predictions
+predict_2025_data <- predict_2025_data %>%
+  mutate(
+    percentChangeYoY = (predicted_total_ordered_2025 - total_ordered_2023) / total_ordered_2023
+  )
+
+
+```
+
+
+When it’s fine to "just run with it":
+If:
+
+You’re sticking with the same predictors (just sub in 2024 data in place of 2023),
+
+The model generalizes well (which your metrics suggest it does — conditional R² = 0.99 is killer),
+
+You don’t need hyper-optimized coefficients and your focus is on insightful, practical predictions,
+
+→ Then go ahead and re-fit Model 3 using 2024 data to predict 2025.
+
+
+
+
+## insights! 
+
+“Which customers are predicted to exceed 400 in 2025, but did not exceed 400 in 2024?”
+
+
+
+```{r}
+
+
+# Create a binary indicator of exceeding 400 in 2024 (which is now stored in total_ordered_2023)
+predict_2025_data <- predict_2025_data |>
+  mutate(
+    grew_2024 = total_ordered_2023 > 400,
+    predicted_grow_2025 = predicted_total_ordered_2025 > 400
+  )
+
+# Filter for new growers: not over 400 in 2024, but predicted to be in 2025
+emerging_2025_growers <- predict_2025_data %>%
+  filter(!grew_2024 & predicted_grow_2025)
+
+# Summary: how many?
+nrow(emerging_2025_growers)
+
+
+# % of all customers that are projected to newly grow
+nrow(emerging_2025_growers) / nrow(predict_2025_data)
+
+# Average predicted volume of new growers
+mean(emerging_2025_growers$predicted_total_ordered_2025)
+
+# Distribution
+ggplot(emerging_2025_growers, aes(x = predicted_total_ordered_2025)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Predicted Volume for New 2025 Growers")
+
+
+
+```
+
+
+```{r}
+emerging_2025_growers |>
+  select(
+    CUSTOMER_NUMBER,
+    Binning_column,
+    total_ordered_2023,               # really their 2024 volume
+    predicted_total_ordered_2025,
+    FREQUENT_ORDER_TYPE,
+    LOCAL_MARKET_PARTNER,
+    CO2_CUSTOMER,
+    customer_age,
+    percentChangeYOY,
+    distance_to_centroid,
+    propCases,
+    retailer_size
+  ) %>%
+  arrange(desc(predicted_total_ordered_2025)) %>%
+  head(20)
+
+
+emerging_2025_growers %>%
+  group_by(Binning_column) %>%
+  summarise(
+    count = n(),
+    avg_predicted_2025 = mean(predicted_total_ordered_2025),
+    avg_2024_order = mean(total_ordered_2023),
+    avg_age = mean(customer_age),
+    percent_LMP = mean(LOCAL_MARKET_PARTNER == "TRUE"),
+    percent_CO2 = mean(CO2_CUSTOMER == "TRUE")
+  ) %>%
+  arrange(desc(count))
+```
+
+
+
+# transitionalry grower 
+
+Are customers who were "transitionary growers" in 2024 expected to keep growing in 2025?
+
+If their average predicted 2025 volume is:
+
+Higher than 2024 → that bin continues to grow → 📈 sustained momentum.
+
+Flat or lower → they may have plateaued or regressed → 🟨 watch list.
+
+
+
+```{r}
+
+# From original data
+avg_2024 <- retailer_set %>%
+  filter(Binning_column == "transitionary growing") %>%
+  summarise(avg_2024 = mean(total_ordered_2024, na.rm = TRUE))
+
+# From predicted 2025
+avg_2025 <- predict_2025_data %>%
+  filter(Binning_column == "transitionary growing") %>%
+  summarise(avg_predicted_2025 = mean(predicted_total_ordered_2025, na.rm = TRUE))
+
+bind_cols(avg_2024, avg_2025)
+
+```
+
+SCALING HURT 2025 predictions, transitionary growers were already 400 in 2024, 
+
+i mean but couldnt we say like with average orderd glalon predictions we expect X number of vuture gallons to be lost if you were to off board these current custoemrs who are under 400 right now> 
+
+
+```{r}
+
+# Step 1: Ensure you have the correct data for predictions
+at_risk_customers <- retailer_set %>%
+  filter(total_ordered_2023 < 400)  # Identify the at-risk customers
+
+# Step 2: Predict 2025 values for these at-risk customers
+predicted_2025 <- predict(mlm_three, newdata = at_risk_customers, allow.new.levels = TRUE)
+
+# Step 3: Add predicted values to the dataset
+at_risk_customers <- at_risk_customers %>%
+  mutate(predicted_2025 = predicted_2025)
+
+# Step 4: Calculate total predicted volume loss for 2025
+total_predicted_loss_2025 <- at_risk_customers %>%
+  summarise(total_loss = sum(predicted_2025, na.rm = TRUE))
+
+# Print the result
+print(total_predicted_loss_2025)
+
+
+```
+
+Explanation:
+Step 1: Filters out the at-risk customers who have less than 400 gallons ordered in 2023.
+
+Step 2: Makes predictions for 2025 using the MLM model (mlm_three).
+
+Step 3: Adds the predicted values (predicted_2025) to the at_risk_customers dataset.
+
+Step 4: Sums the predicted values to calculate the total predicted volume loss in 2025 for these at-risk customers.
+
+This approach ensures that the predictions are correctly associated with the corresponding customers. You should now be able to calculate the total predicted loss for 2025.
+
+Let me know if this resolves your issue or if you'd like to dive deeper into the analysis!
+
+
+
+So, if your predicted_2025 value is 618067.4, it is likely representing the total predicted gallons for the at-risk customers who were identified. If you want to confirm the units or explore any conversions, I would recommend checking the documentation or metadata of your dataset, especially the variables like total_ordered_2023 and total_ordered_2024 to verify the units.
+
+
+
+what if we also looked at a lower number like if we want to see people who were not at 400 in 23 but then maybe crossed in either 24 or were predicted to in 25? 
+
+
+what if we also looked at a lower number like if we want to see people who were not at 400 in 23 but then maybe crossed in either 24 or were predicted to in 25? bc transitionary growing was the segment for total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY > 0 ~ "transtionary growin so its already capturing the peple that crossed 400 between 23 and 24, but holistically i am interested in those who are currently under 400 that we think will be over 400 in 2025 did i do that? 
+
+
+Graph ideas:
+appendix graph for model reuslts comparison 
+
+
+
+#FUCKKKK
+
+
+
+
+## Walkthrough
+I reloaded the data to make it into a more whole structure. We determined through extensive EDA and other models that retailers should be split from non retail groups (R Part Trees, logistic regression, statistical t tests) However, I wanted to use MLM's as a modeling resource as I think it would help answer Swires question better than some of the earlier modeling we did. 
+
+MLM, or multi level models also knows as mixed effect models, or heiracrchal modesl are statstical modesl that can account for fixed effects and random effects.
+
+Fixed effects are conssistn effects across all custoemrs, we have seen privously that order volume is a consistnet strong effect in ordering behavior of customesr 
+
+Random effects are group specific effects that allow clusters to have thier own intercepts of behaviors. 
+
+I think MLM modeling in this case is helpful bc we have one giant set of customers that can be broken down into smaller groups, and we have had issues builidng enough sensitivity to find what kind of customer factors are relevant and important. 
+
+MLMs help us in answering SWIRE's problem because we can use the fixed effects in an MLM to give direct answers on what kinds of factors predict growth 
+
+We can also utilize MLM's to figure out which groups are better or worse than expected. 
+
+MLM models tell us what variables impact growth across all customers (something we have been able to explore in other models too) but it also can tell us over and under performers, as well as groups that outperform their grouped characterisitics. MLM models can also give us further confidence to trust model predictions in guidifin sales and support strategy. 
+
+MLM models are particulary good here, because as we have well explored in EDA and early modeling we see issues in determining outstanding fixed effects (we largely did not find early strong predictors of growth)
+
+we can use MLM models to 
+- quantify the performance of a group 
+- find those important emerging customers 
+
+
+**MLM notes** 
+- we expect to see group level factors influence cutomer behavoir 
+- we need to account for shared variance within a group (region, retail)
+- helps to get more accurate estimates of fixed effects by removing noise from group effects
+
+Fixed Effects: Directly estimate their impact
+Random Effects: Capture variability across groups
+
+
+ (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY >=0.05 ~ "high volume high growth",
+          (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY > 0 ~ "transtionary growing",
+          (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY <= 0 ~ "transitionary declining" )) %>% 
+   filter(numberOfOutlets == 1) 
+   
+   
+
+# Multi Level modeling 1 
+
+Use multi-level modeling to uncover what traits predict growth, and which sub-400 customers should not be moved to ARTM.
+
+```{r}# SCRAPPED THIS WHOLE THING, does not make sense in MLM modeling, 
+
+customer_full <- customer_full |>
+mutate(
+    exceeds_400_2023 = if_else(total_volume_2023 >= 400, 1, 0),
+    exceeds_400_2024 = if_else(total_volume_2024 >= 400, 1, 0)
+  )
+
+customer_full <- customer_full |>
+  mutate(
+    retailer_size = if_else(is.na(retailer_size), 0L, retailer_size)
+  )
+
+```
+
+## general MLM model mixed retail and non retail
+
+Filtering for customers who are under 400 in 2023
+
+why did i choose to do this (i later compare results with full data too)?
+
+Using this method mimics Swire’s concern: who is at risk of being sent to ARTM but might grow next year?
+
+We are kind of looking to solve that flase negative risk, customers who look small in 2023 but actually grow in 2024. We want to make sure we know who they are before we accidenlty move them to ARTM. Because this is the central business concern we should build our model to operate the best in this group of customers. 
+
+If we were to use all customers we would really be modeling a question of which customers grow in 2024 regardless of size in 2023. -> i think this should be explored still, as we could figure out what drives overall growth, as well as factors for consistent reliable performers. WE could use these models to find the top dogs and ensure those customers are taken care of. 
+
+### presentation explanation if needed:
+
+trained the model on customers below 400 gallons in 2023 bc thats where SWIRES operation decision happens - whether to keep them on Red truck or move to ARTM. We did not want to really model overall growth and there were a few reasons 
+- there are super strong customers in the data set, ones well over 400 in both years, these are no where near at risk of being misclassified, we know to keep them on red truck.
+we did not need to model overall growth for SWIRE, we needed to be more specific on the intervention decisions - having limited forsight but getting a decision made on customers moving to ARTM. 
+the more focusesd modeling allows us to better flag the false negatives (looks like ARTM should be implemented but actually gonna grow), this will protect the high growth customers from risk of misclassification.
+
+
+
+
+
+```{r}## again scrapped, does not make sense,
+# filtering the data for those in 2023 with under 400 orders 
+model_data <- customer_full |>
+  filter(exceeds_400_2023 == 0) |>
+  mutate(
+    LOCAL_MARKET_PARTNER = as.factor(LOCAL_MARKET_PARTNER),
+    CO2_CUSTOMER = as.factor(CO2_CUSTOMER),
+    cluster = as.factor(cluster),
+    is_retailer = as.factor(is_retailer),
+    FREQUENT_ORDER_TYPE = as.factor(FREQUENT_ORDER_TYPE)
+  )
+colnames(model_data)
+
+```
+
+
+I am starting with a simple mlm model on the data for a mix of retilaers and non retailers to get a baseline understanding 
+
+
+
+```{r}
+# mlm model on non retailer data: 
+
+colnames(non_retailer_set)
+
+# clean up:
+
+# Ensure correct formats
+retailers_clean <- non_retailer_set |>
+  filter(is_retailer == 1) |> # just to confirm
+  mutate(
+    PRIMARY_GROUP_NUMBER = as.factor(PRIMARY_GROUP_NUMBER),
+    FREQUENT_ORDER_TYPE = as.factor(FREQUENT_ORDER_TYPE),
+    LOCAL_MARKET_PARTNER = as.factor(LOCAL_MARKET_PARTNER),
+    CO2_CUSTOMER = as.factor(CO2_CUSTOMER),
+    binning_column = your_binning_column,  # create this if you haven't yet
+    binning_column = as.factor(binning_column),
+    total_volume_2023_scaled = scale(total_volume_2023),
+    distance_to_centroid_scaled = scale(distance_to_centroid)
+  )
+
+# linear mlm model 1
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+ Formula: total_ordered_2024 ~ customer_age + LOCAL_MARKET_PARTNER + CO2_CUSTOMER +  
+    propCases + distance_from_centroid + total_ordered_2023 +      percentChangeYOY + (1 | Binning_column)
+   Data: train_setMLM3
+
+
+MLMTrain3 <- lmer(total_ordered_2024~customer_age + LOCAL_MARKET_PARTNER + CO2_CUSTOMER + propCases + distance_from_centroid + total_ordered_2023 + percentChangeYOY +  (1|Binning_column), data = train_setMLM3)
+
+
+^^ code Madz used
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+# model exceeds_400_2024 using predictors Swire cares about, and allow intercepts to vary by location cluster
+
+summary(model_data$LOCAL_MARKET_PARTNER)
+summary(model_data$CO2_CUSTOMER)
+summary(model_data$is_retailer)
+summary(model_data$FREQUENT_ORDER_TYPE)
+summary(model_data$cluster)
+
+model_data <- model_data |>
+  mutate(
+    LOCAL_MARKET_PARTNER = droplevels(as.factor(LOCAL_MARKET_PARTNER)),
+    CO2_CUSTOMER = droplevels(as.factor(CO2_CUSTOMER)),
+    is_retailer = droplevels(as.factor(is_retailer)),
+    FREQUENT_ORDER_TYPE = droplevels(as.factor(FREQUENT_ORDER_TYPE)),
+    cluster = droplevels(as.factor(cluster))
+  )
+
+model_data |>
+  summarise(
+    across(c(retailer_size, total_volume_2023, prop_delivered_2023, distance_to_centroid),
+           ~ n_distinct(.x))
+  )
+
+# first mlm model on retialers and non retailers
+mlm_one <- glmer(
+  exceeds_400_2024 ~ total_volume_2023 + LOCAL_MARKET_PARTNER + CO2_CUSTOMER + FREQUENT_ORDER_TYPE + is_retailer + retailer_size + distance_to_centroid + (1 | cluster),
+  data = model_data,
+  family = binomial
+)
+
+summary(mlm_one)
+
+# mlm logistic model, 
+
+```
+
+this model used the clusters as the random effect, but we see that the model has singular fit, this means as a random effect location doesn't explain much **again confirming what we already know** Distance to centriod is also tiny and non-significant.
+
+What this does tell us is: 
+strong previous volume is the best predictor of growth **again we been knowing this** 
+
+CO2 customers and retailers are more likely to grow **we know these two to be significant and positive in other past models too**
+
+In this data set we see LMP status as a negative predictor **again we know this**
+
+WE also see that retailer size may dilute growth, being the biggest retialer is not the best **again we know this from prior modeling, all this reinforces what we have found**
+
+From this one MLM model we know that customers with higher 2023 volume, CO2 usage, and retailer affiliation had the strongest likelihood of growing past 400 gallons in 2024. 
+
+Additionally i finally saw order channle as important, at this point in the model 
+
+Ordering channel also played a major role — EDI customers had nearly 14x the odds compared to call center customers.”
+
+
+
+```{r}
+glm_fixed <- glm(
+  exceeds_400_2024 ~ total_volume_2023 + LOCAL_MARKET_PARTNER + CO2_CUSTOMER +
+    FREQUENT_ORDER_TYPE + is_retailer + retailer_size + distance_to_centroid,
+  data = model_data,
+  family = binomial
+)
+
+summary(glm_fixed)
+
+# AIC
+AIC(glm_fixed)
+
+# ROC + AUC
+roc_obj <- pROC::roc(model_data$exceeds_400_2024, glm_fixed_probs)
+pROC::auc(roc_obj)
+
+# Build and plot ROC
+roc_obj <- pROC::roc(model_data$exceeds_400_2024, glm_fixed_probs)
+plot(roc_obj, main = "ROC Curve: GLM Fixed Effects Only")
+
+```
+
+this is a standard glm with fixed effects, it assumes all observations are independant. and instead of using cluster as structure it treats it as noise. 
+
+compared the mlm model one, we used cluster as a random intercept allowing each cluster to have its own baseline growth tendency. 
+
+
+AIC of the glm model is lower 8999.2 than mlm(which was 9001.2), meaning this simpler model actually fits better by AIC
+
+
+**Significant positive predictors of crossing 400 gallons**
+
+total_volume_2023 — higher previous volume = more likely to grow.
+
+CO2_CUSTOMER, FREQUENT_ORDER_TYPE*, and is_retailer — all indicate stronger likelihood of growth.
+
+**Significant negative predictors**
+
+LOCAL_MARKET_PARTNERTRUE — surprisingly, LMP status is associated with lower likelihood of growth.
+
+retailer_size — larger retailer groups are less likely to grow at the outlet level.
+
+High-performing, small, CO2-buying retailers with MYCOKE LEGACY or EDI order types are more likely to cross 400.
+
+- with the mlm model we were able to confirm that location is not driving growth variation. **SWIRE does not need to create growth strategy around location**
+
+the mlm performed worse in the specific case of cluster as random effect
+
+```{r}
+# Define cross-validation folds
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE
+)
+
+# Convert outcome to factor for caret
+model_data$exceeds_400_2024_f <- factor(model_data$exceeds_400_2024, levels = c(0, 1), labels = c("No", "Yes"))
+
+# Run cross-validated GLM
+cv_model <- train(
+  exceeds_400_2024_f ~ total_volume_2023 + LOCAL_MARKET_PARTNER + CO2_CUSTOMER +
+    FREQUENT_ORDER_TYPE + is_retailer + retailer_size + distance_to_centroid,
+  data = model_data,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC"
+)
+
+print(cv_model)
+
+
+coords(roc_obj, "best", ret = c("threshold", "sensitivity", "specificity"))
+
+
+model_data$predicted_class_f <- factor(
+  ifelse(glm_fixed_probs > 0.0543, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+caret::confusionMatrix(model_data$predicted_class_f, model_data$exceeds_400_2024_f, positive = "Yes")
+
+
+```
+
+cross validation - 
+
+so this is like the model to interpret growth from the full set of customers that are currently under volume. 
+
+Class imbalance is the hard part Only ~5.5% of the customers actually exceeded 400 gallons- even a decent model will struggle with precision for these emerging 
+
+the model is  better at identifying non-growers than growers which aligns with an ideal threshold of 0.0543 to capture more positives.
+
+the glm model is robust, it performs nearly as well as the MLM(but with better interpretability. 
+
+#MLM Retailer & Non retailer split
+
+Now we know that we have model behavior improve in prior models when we split retailers from non retailers, lets work with those sub groups to determine insights
+
+we built a base MLM, so much past modeling and EDA has let us know that retailers vs non retailers is an important split, especailly bc retailers have specific features that non retailers dont have. 
+
+I will continue to work with the subset of data for those under 400 in 23 and split into retail and non retail
+
+```{r}
+
+#mlm modeling for retailers and non retailers seperateley 
+
+retailers <- model_data |>
+  filter(is_retailer == 1) |>
+  mutate(
+    CO2_CUSTOMER = droplevels(as.factor(CO2_CUSTOMER)),
+    LOCAL_MARKET_PARTNER = droplevels(as.factor(LOCAL_MARKET_PARTNER)),
+    FREQUENT_ORDER_TYPE = droplevels(as.factor(FREQUENT_ORDER_TYPE)),
+    PRIMARY_GROUP_NUMBER = droplevels(as.factor(PRIMARY_GROUP_NUMBER)),
+    retailer_size = as.numeric(retailer_size),
+    total_volume_2023_scaled = scale(total_volume_2023),
+    distance_to_centroid_scaled = scale(distance_to_centroid)
+  )
+
+# MLM for retailers
+mlm_retailers <- glmer(
+  exceeds_400_2024 ~ total_volume_2023_scaled + LOCAL_MARKET_PARTNER + CO2_CUSTOMER +
+    FREQUENT_ORDER_TYPE + retailer_size + distance_to_centroid_scaled +
+    (1 | PRIMARY_GROUP_NUMBER),
+  data = retailers,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+
+#  non-retailer dataset
+non_retailers <- model_data |>
+  filter(is_retailer == 0) |>
+  mutate(
+    CO2_CUSTOMER = droplevels(as.factor(CO2_CUSTOMER)),
+    LOCAL_MARKET_PARTNER = droplevels(as.factor(LOCAL_MARKET_PARTNER)),
+    FREQUENT_ORDER_TYPE = droplevels(as.factor(FREQUENT_ORDER_TYPE)),
+    cluster = droplevels(as.factor(cluster)),
+    total_volume_2023_scaled = scale(total_volume_2023),
+    distance_to_centroid_scaled = scale(distance_to_centroid)
+  )
+
+# MLM for non-retailers
+mlm_non_retailers <- glmer(
+  exceeds_400_2024 ~ total_volume_2023_scaled + LOCAL_MARKET_PARTNER + CO2_CUSTOMER +
+    FREQUENT_ORDER_TYPE + distance_to_centroid_scaled +
+    (1 | cluster),  # we could remove this bc we know its not helpful
+  data = non_retailers,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+# we get a singular fit when we use cluster as a random effect, this further cements our finding that cluster is not explaining the variance in the model: 
+
+
+
+summary(mlm_retailers)
+summary(mlm_non_retailers)
+
+exp(fixef(mlm_retailers))
+exp(fixef(mlm_non_retailers))
+
+```
+
+Retailer summary:
+
+**PRIMARY_GROUP_NUMBER Variance = 3.38, SD = 1.84 there's meaningful variation between retailer groups.**
+
+
+**significant predictors**
+
+total_volume_2023_scaled (p < .001): strong positive predictor.
+
+CO2_CUSTOMERTRUE and FREQUENT_ORDER_TYPEEDI also matter.
+
+retailer_size: negatively associated, highly significant.
+
+LOCAL_MARKET_PARTNER, distance_to_centroid, and most order types are not significant here.
+
+
+**Non retailer:**
+Random effect of cluset is not important, we could try other grouping methods - mostly just using this to compare as baseline for retailer mlm performance. 
+
+**Significant predictors**
+
+total_volume_2023_scaled: again very strong positive predictor
+
+FREQUENT_ORDER_TYPEMYCOKE360 and SALES REP are strong positives
+
+**not sig**
+LOCAL_MARKET_PARTNER and CO2_CUSTOMER not statistically significant
+
+**retailer summary**
+among retailer customers, 2023 volume and CO2 usage were the strongest predictors of growth.
+
+Ordering channel, retailer size, and location did not meaningfully impact growth odds.
+
+However, significant variation across PRIMARY_GROUP_NUMBER shows that some retailer groups are consistently better performers
+
+**non retailer summary** 
+
+Among non-retailers, 2023 volume and MYCOKE360 (channel) usage were the clearest indicators of growth.
+
+Location and CO2 usage were not predictive.
+
+location clustering was not important 
+
+**Volume is consistently the top predictor across models**
+
+
+**Retailer group matters, the random effect in the retailer model meaningfully explains variation, so segmenting retailers makes sense** 
+
+
+**Order type behavior is more predictive for non-retailers, while group-level patterns matter more for retailers.**
+
+retailer groups belong to a primary group, there is a nested strucure, the MLM help us see if some retailers are consistenlty better at producing growth 
+
+cluster variable gave us a nested structure by location, we tested and found that cluster did not matter (both in mixed customer settting and controlling for retail and non retail groups)
+
+we used local market partner status as a fixed effect in retail and non retail MLM groups, we did not find it to be signficnat in either group, LMP status does not predict growth (after adjusting fro volume, CO2 and channel)
+
+
+ ## retailer group review 
+
+why we use primary group as a random effect
+analyzing how each retail group (via PRIMARY_GROUP_NUMBER) performed relative to expectations, using the random intercepts from your mixed effects model (mlm_retailers).
+
+This helps Adjust for known predictors (volume, order type, CO2, etc.)
+
+
+
+```{r}
+ranef_vals <- ranef(mlm_retailers)$PRIMARY_GROUP_NUMBER
+head(ranef_vals)
+
+group_effects <- ranef_vals|>
+  rownames_to_column("PRIMARY_GROUP_NUMBER")|>
+  rename(random_intercept = `(Intercept)`)|>
+  mutate(PRIMARY_GROUP_NUMBER = as.integer(PRIMARY_GROUP_NUMBER))|>
+  arrange(desc(random_intercept))
+
+
+group_summary <- retailers|>
+  group_by(PRIMARY_GROUP_NUMBER)|>
+  summarise(
+    n_outlets = n(),
+    avg_2023_volume = mean(total_volume_2023),
+    grow_rate_2024 = mean(exceeds_400_2024)
+  )
+
+group_analysis <- group_effects|>
+  mutate(PRIMARY_GROUP_NUMBER = as.character(PRIMARY_GROUP_NUMBER))|>
+  left_join(
+    group_summary|> mutate(PRIMARY_GROUP_NUMBER = as.character(PRIMARY_GROUP_NUMBER)),
+    by = "PRIMARY_GROUP_NUMBER"
+  )
+
+
+ggplot(group_analysis, aes(x = random_intercept, y = grow_rate_2024)) +
+  geom_point() +
+  labs(
+    title = "Retail Group Random Effects vs. Growth Rate",
+    x = "Retail Group Random Intercept (Deviation from Baseline)",
+    y = "Proportion of Customers Exceeding 400 in 2024"
+  ) +
+  theme_minimal()
+```
+
+
+X-axis: Random intercepts from your mixed-effects model (mlm_retailers) — i.e., how much each retail group deviates from the average likelihood of growth after adjusting for other predictors.
+
+Y-axis: The actual proportion of customers in that retail group who exceeded 400 in 2024 (your observed outcome).
+
+
+ model correctly identifies which retail groups are high vs. low performers — even after accounting for things like volume, order type, etc.
+
+
+You Can Prioritize Based on Group Effect
+Top-right: High random effect + high actual growth =  Reliable performers. Swire can trust these groups.
+
+High X but moderate Y: High latent potential — model thinks they should grow more than they currently are. 🔥 Target for activation.
+
+Low X and low Y:  At-risk groups — model and data agree they’re underperforming.
+
+```{r}
+top_groups <- group_analysis|>
+  arrange(desc(random_intercept))|>
+  slice_head(n = 10)
+
+underdogs <- group_analysis|>
+  filter(random_intercept > 1, grow_rate_2024 < 0.25)
+
+```
+**need to add volume per outlet back**
+
+
+Option A: PRIMARY_GROUP_NUMBER as a Random Effect (what you're doing now)
+This assumes:
+
+Each group (e.g. a franchise chain or ownership cluster) might behave uniquely due to things you can’t measure directly — e.g., leadership quality, sales team, internal SOPs.
+
+You're estimating group-specific deviations after adjusting for predictors.
+
+Good for identifying latent group differences. But it doesn’t explain why some groups do better — only that they do.
+
+```{r}
+
+model_base <- glmer(
+  exceeds_400_2024 ~ total_volume_2023_scaled + FREQUENT_ORDER_TYPE +
+    LOCAL_MARKET_PARTNER + CO2_CUSTOMER + distance_to_centroid_scaled +
+    retailer_size + (1 | PRIMARY_GROUP_NUMBER),
+  data = retailers,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+
+retailers$retailer_size_group <- as.factor(retailers$retailer_size)
+
+model_random_size <- glmer(
+  exceeds_400_2024 ~ total_volume_2023_scaled + FREQUENT_ORDER_TYPE +
+    LOCAL_MARKET_PARTNER + CO2_CUSTOMER + distance_to_centroid_scaled +
+    (1 | retailer_size_group),
+  data = retailers,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+
+AIC(model_base, model_random_size)
+
+anova(model_base, model_random_size)
+
+
+
+```
+^ questioning the impact of retailer size. 
+
+
+model_base (with PRIMARY_GROUP_NUMBER as random effect + retailer size as fixed effect)
+AIC: 3102.1
+
+Significantly better model fit
+
+🔹 model_random_size (with retailer_size as random effect)
+AIC: 3401.4
+
+Worse fit
+
+📊 Chi-squared Test:
+Chi-sq = 301.26, p < 0.00000000000000022
+
+This means the added complexity in model_base is justified — the group-specific variation in PRIMARY_GROUP_NUMBER is a strong predictor of performance.
+
+group specific variation 
+
+Keep PRIMARY_GROUP_NUMBER as the random effect — it's capturing important unobserved heterogeneity in retailer performance.
+
+➡️ retailer_size should stay as a fixed effect, not a random one — making it random worsens the model.
+
+
+## Retailer insights from MLM - 
+mlm was strong, we should use retailer groups as random effects
+
+
+In the business context, using PRIMARY_GROUP_NUMBER as a random effect means you're treating each retailer group as a unique cluster with its own baseline likelihood of customer growth — beyond what the fixed effects (like size, order type, CO2, etc.) can explain.
+
+
+Among lower-volume retail groups (under 400 gallons in 2023), what predicts growth in 2024 — and how much does performance vary across groups?--> 
+
+
+Outcome: Whether a retailer exceeded 400 gallons in 2024 (exceeds_400_2024)
+
+Fixed Effects:
+
+total_volume_2023_scaled: Starting volume
+
+CO2_CUSTOMER: Whether the customer orders CO2
+
+FREQUENT_ORDER_TYPE: Their main way of placing orders (EDI, MyCoke, Sales Rep, etc.)
+
+retailer_size: How many outlets in the group
+
+distance_to_centroid: Geographic distance from a hub
+
+“Retailers are not all created equal.”
+The random effect for PRIMARY_GROUP_NUMBER captures unexplained performance differences between retailer groups.
+
+Some groups consistently outperform expectations, others underperform — even after controlling for size, order type, and CO2 status.
+
+These differences might be due to:
+
+Sales rep relationships
+
+Store management
+
+Local business culture
+
+Regional marketing strategy
+
+💬 Business insight: Swire could prioritize outreach to high-potential underperformers — groups that should be growing, but aren't.
+
+
+
+2. CO2 ordering is a strong signal.
+The model showed CO2_CUSTOMERTRUE as a significant predictor of growth.
+
+These customers are more likely to exceed 400 gallons, potentially because they’re:
+
+Selling fountain drinks
+
+Handling high-volume events
+
+More committed to the partnership
+
+💬 Business insight: Flag non-CO2 retailers for growth conversations or CO2 pilot programs.
+
+
+3. Order type matters.
+Sales Rep and MyCoke360 users showed stronger growth probabilities.
+
+MyCoke Legacy wasn’t significantly different, and EDI wasn’t common.
+
+💬 Business insight: Encourage low-volume groups to migrate to Sales Rep support or MyCoke360, which may reflect better digital engagement or sales team involvement.
+
+
+4. Retailer size and geography? Mixed.
+retailer_size: Larger groups are less likely to grow on a per-outlet basis — possibly because they're already saturated.
+
+distance_to_centroid: Not significant — distance doesn’t hurt odds of growing.
+
+💬 Business insight: Focus on small-to-mid-size groups who aren’t yet saturated. Proximity to hubs isn’t a barrier.
+
+Find retailer groups who:
+✅ Have strong predictors of growth (based on volume, order type, CO2 usage, etc.)
+
+❌ But actually performed worse than expected
+
+📉 Show negative random intercepts from the MLM — suggesting underperformance relative to their inputs
+
+
+
+🐶 "Underdogs" = High Potential, Low Performance
+They are retail groups that your model believes should be growing (based on everything it’s learned: volume, ordering type, CO2 status, etc.)...
+
+👉 But in reality, they’re not.
+
+🔍 Why does this matter?
+Because these groups are:
+
+Model-predicted to have a high likelihood of growth (high random intercept)
+
+Actually showing low growth rates (low % of customers exceeding 400 in 2024)
+
+This mismatch tells you:
+
+⚠️ Something is holding them back. Not data-driven factors — maybe it’s operational, service-level, relationship-based, etc.
+
+📣 What Swire should do:
+Target these groups for outreach or support
+
+Investigate questions like:
+
+Are they assigned to a rep?
+
+Are they using older platforms (MYCOKE LEGACY)?
+
+Are there delivery or stocking issues?
+
+These are high-upside plays — if you fix the friction, the volume should follow.
+
+
+
+
+
+
+
+
+
+# does LMP depend on retailer status? 
+
+```{r}
+
+model_data <- model_data |>
+    mutate(
+    CO2_CUSTOMER = droplevels(as.factor(CO2_CUSTOMER)),
+    LOCAL_MARKET_PARTNER = droplevels(as.factor(LOCAL_MARKET_PARTNER)),
+    FREQUENT_ORDER_TYPE = droplevels(as.factor(FREQUENT_ORDER_TYPE)),
+    PRIMARY_GROUP_NUMBER = droplevels(as.factor(PRIMARY_GROUP_NUMBER)),
+    retailer_size = as.numeric(retailer_size),
+    total_volume_2023_scaled = scale(total_volume_2023),
+    distance_to_centroid_scaled = scale(distance_to_centroid)
+  )
+
+glm_combined <- glm(
+  exceeds_400_2024 ~ total_volume_2023_scaled + CO2_CUSTOMER + FREQUENT_ORDER_TYPE +
+    is_retailer * LOCAL_MARKET_PARTNER,
+  data = model_data,
+  family = binomial
+)
+
+summary(glm_combined)
+
+model_used <- model.frame(glm_combined)
+# actual data used in the model 
+
+# Set outcome and predictions
+test_y <- model_used$exceeds_400_2024
+predicted_probs <- predict(glm_combined, type = "response")
+
+# ROC + AUC
+roc_obj <- pROC::roc(response = test_y, predictor = predicted_probs)
+pROC::auc(roc_obj)
+
+
+# Build and plot ROC
+roc_obj <- pROC::roc(response = test_y, predictor = predicted_probs)
+plot(roc_obj, main = "ROC Curve: GLM Combined Model")
+
+# View thresholds and trade-offs
+coords_df <- coords(roc_obj, x = "all", ret = c("threshold", "sensitivity", "specificity"))
+head(coords_df, 10)
+
+
+# Find threshold with best balance
+coords_df <- coords(roc_obj, x = "all", ret = c("threshold", "sensitivity", "specificity", "accuracy"))
+coords_df <- as.data.frame(coords_df)
+
+# View best tradeoff threshold
+coords_df[which.max(coords_df$accuracy), ]  # Or customize with best Sensitivity + Specificity balance
+
+ggplot(coords_df, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line() +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Curve with Threshold Trade-offs",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  )
+
+# Find the threshold that gives sensitivity of ~70% or 80%, and see what specificity you’d be trading off.
+
+coords_df[which.min(abs(coords_df$sensitivity - 0.8)), ]
+
+# While the threshold with the highest statistical accuracy was 0.404, it only caught 2% of future growers. For Swire’s use case, we instead propose a more proactive threshold that captures 80% of future growers, reducing the risk of ARTM-ing high-potential customers. This balances sensitivity with operational reality
+
+
+# even further, if we want to say what happens opperationally? like If we keep the top 25% of predicted growers on red trucks, we retain X% of actual growers, with a precision of Y%
+
+```
+Does the effect of being a Local Market Partner differ depending on whether the customer is a retailer or not? 
+ 
+**tested whether Local Market Partnerstatus influenced customer growth — and whether that effect differed for retailers vs. non-retailers.**
+The results show no significant effect of LMP status overall, and no difference in effect between groups. This suggests LMP status is not a useful segmentation variable when predicting growth potential. 
+
+The effect of Local Market Partner status does not vary significantly between retailers and non-retailers in this model.
+So this interaction model fits slightly worse than the simpler GLM, and adding the interaction doesn’t seem to improve performance.
+
+
+**Don't prioritize LMP vs. non-LMP in ARTM decisions — it's not a meaningful predictor of future volume growth**
+>> used an interaction to formally test a hypothesis, controlled for known predictors like total_volume, CO2, channel, confirmed an assumption that lets Swire simplify segmentation strategy
+
+
+
+```{r}
+# mlm_retailers mlm_non_retailers glm_combined
+model_used <- model.frame(glm_combined)  
+model_used$predicted_prob <- predict(glm_combined, type = "response")
+
+str(model_used$predicted_prob)  
+summary(model_used$predicted_prob)  # sanity check
+model_used$pred_bin <- cut(model_used$predicted_prob, breaks = seq(0, 1, 0.05), include.lowest = TRUE)
+
+
+ggplot(model_used, aes(x = pred_bin, fill = factor(exceeds_400_2024))) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Calibration: Actual Growers Within Predicted Probability Bins",
+    x = "Predicted Probability (Binned)",
+    y = "Proportion of Growers",
+    fill = "Grew in 2024?"
+  ) +
+  theme_minimal()
+
+table(model_used$pred_bin)
+
+
+```
+
+If it rises steadily from left to right, it’s well-calibrated and trustworthy for probability-based decision rules.
+
+
+In low predicted bins [0, 0.05], very few customers actually grew. ✅ Good calibration at the low end.
+
+As predicted probabilities increase (from ~0.25 onward), the proportion of actual growers increases — this is what we want to see.
+
+The highest bin (0.45, 0.5] has a strong majority of actual growers (the turquoise portion), which means:
+
+Customers here were correctly predicted as likely to grow, and
+
+Your model is doing a decent job ranking customers by likelihood, even if probabilities aren’t super sharp.
+
+
+
+The vast majority of customers are concentrated in the lowest bins, which aligns with class imbalance (few actually grow).
+
+Only 5 customers fell in the top bin — and none beyond 0.5.
+
+This strongly suggests your model is well-calibrated, but conservative — rarely assigning high probabilities.
+
+
+
+the scarcity of positive outcome cases (customers going from under 400 to over 400) creates a challenge for both modeling and operational decision-making. If Swire is open to considering a new growth threshold, here’s how you could help them define it analytically and strategically:
+
+
+
+# Comparison of all three plots:
+ 
+ 
+ 
+ 
+
+
+
+
+
+**notes start**
+for model metrics we care how well it can distinguish between those who do exceed and those who do not exceed. 
+
+
+AUC / ROC: 	Overall model discrimination ability (1.0 = perfect, 0.5 = random)
+Confusion matrix:	How well the model predicts 1s and 0s at a given cutoff
+Accuracy / Precision / Recall / F1	Tradeoffs in prediction quality
+Pseudo R² (like McFadden)	Approx. how well the model explains variance
+
+
+
+Our model can correctly rank a randomly chosen grower higher than a non-grower 80.6% of the time — which indicates excellent predictive power for this classification problem.
+
+we cannot really use train/test splits on glmer with random effects validation:
+
+GLMs (like your glm_combined) → Absolutely use train/test or k-fold CV to validate performance.
+
+GLMMs (MLMs) →
+
+Either: use the full dataset for inference, and report AUC + significance
+
+Or: use group-level CV, e.g., leave out some retailer groups (PRIMARY_GROUP_NUMBER) entirely and test generalizability
+
+**notes end** 
+
+
+
+okay yea, lets keep going, i think before i noticed the NA issue i was answering swire is specifically interested in a segment that explores the LMP customers who do not order CO2 (so the Co2 column is false) , i need to get a better model fro non retailers, i need to understand how the frequent order types affect ording behavior as we found them to be important in the MLM model, i also want to consider how we can use more data, is there a better threhsold? we are limiting the data so muich to the under 400 in 2023, i also want to explore trends and insights on the strong consisintet performers 
+
+
+## LMP Customers Without CO₂ (Non-Retailers)
+Since Swire is especially interested in this segment, let’s:
+
+do the data subset for those who are LMP and do not have CO2 
+
+fit a model just on this group to assess predictors of growth
+
+```{r}
+
+#LMP customers without CO2 who are not retailers
+lmp_noco2_nonretail <- model_data |>
+  filter(LOCAL_MARKET_PARTNER == TRUE,
+         CO2_CUSTOMER == FALSE,
+         is_retailer == 0)
+
+table(lmp_noco2_nonretail$FREQUENT_ORDER_TYPE)
+
+#base GLM to see what matters in this subgroup
+glm_lmp_noco2 <- glm(
+  exceeds_400_2024 ~ total_volume_2023_scaled + FREQUENT_ORDER_TYPE + distance_to_centroid_scaled,
+  data = lmp_noco2_nonretail,
+  family = binomial
+)
+
+summary(glm_lmp_noco2)
+
+
+```
+Target MyCoke360 and Sales Rep customers in the LMP/no-CO2/non-retail group — they have the strongest potential.
+
+Legacy and Other order types might benefit from nudges or campaigns if they’re underutilizing growth tools.
+
+Prior year volume is a reliable signal of readiness to grow.
+
+This subgroup (n ≈ 7,194) is large enough to consider as a focused pilot or intervention group.
+
+
+
+```{r}
+# prepare full non-retail dataset
+non_retailers_full <- customer_full |>
+  filter(is_retailer == 0) |>
+  mutate(
+    CO2_CUSTOMER = droplevels(as.factor(CO2_CUSTOMER)),
+    LOCAL_MARKET_PARTNER = droplevels(as.factor(LOCAL_MARKET_PARTNER)),
+    FREQUENT_ORDER_TYPE = droplevels(as.factor(FREQUENT_ORDER_TYPE)),
+    total_volume_2023_scaled = scale(total_volume_2023),
+    distance_to_centroid_scaled = scale(distance_to_centroid)
+  )
+
+# Fit an updated GLM model
+glm_nonretail_all <- glm(
+  exceeds_400_2024 ~ total_volume_2023_scaled + FREQUENT_ORDER_TYPE +
+    LOCAL_MARKET_PARTNER + CO2_CUSTOMER + distance_to_centroid_scaled,
+  data = non_retailers_full,
+  family = binomial
+)
+
+# View summary
+summary(glm_nonretail_all)
+
+
+
+# Step 1: Get predicted probabilities
+predicted_probs <- predict(glm_nonretail_all, type = "response")
+
+# Step 2: Use the actual binary response (make sure it's numeric or factor)
+test_y <- non_retailers_full$exceeds_400_2024  # adjust if needed
+
+# Step 3: Calculate ROC and AUC
+library(pROC)
+roc_obj <- pROC::roc(response = test_y, predictor = predicted_probs)
+
+# Step 4: Print AUC
+pROC::auc(roc_obj)
+
+# Step 5: Plot ROC Curve
+
+plot(roc_obj, main = "ROC Curve: GLM Non-Retailers (All Data)")
+
+
+# compare with the ones from the mlm on non retailers with only under 400 in 23 as the data: 
+mlm_probs <- predict(mlm_non_retailers, type = "response")
+mlm_y <- non_retailers$exceeds_400_2024
+
+roc_obj_mlm <- pROC::roc(response = mlm_y, predictor = mlm_probs)
+pROC::auc(roc_obj_mlm)
+plot(roc_obj_mlm, main = "ROC Curve: MLM Non-Retailers (<400 in 2023)")
+
+
+
+# compare with the ones from the mlm on  retailers with only under 400 in 23 as the data: 
+mlm_probs <- predict(mlm_retailers, type = "response")
+mlm_y <- retailers$exceeds_400_2024
+
+roc_obj_mlm <- pROC::roc(response = mlm_y, predictor = mlm_probs)
+pROC::auc(roc_obj_mlm)
+plot(roc_obj_mlm, main = "ROC Curve: MLM Retailers (<400 in 2023)")
+
+summary(mlm_retailers)
+
+```
+
+
+
+You're recognizing that outlets aren't independent — they're nested within retailer groups, Rather than estimating a fixed effect for each group (which would explode the model with hundreds of coefficients), you estimate the distribution of those effects — that’s what MLMs are built for.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Volume + order method = your predictive sweet spot.
+
+CO2 and distance don't add much predictive power for non-retailers.
+
+MYCOKE360 and Sales Rep customers are consistently more likely to grow.
+
+This model (AIC = 4883.6) fits better than the smaller LMP+non-CO2-only model (AIC = 2127 on ~7k records), thanks to more inclusive data.
+
+
+GLM: 
+
+AUC: ~0.92
+
+Plot: Smooth and steep curve — excellent discriminative power
+
+Insight: The model is very confident and accurate when the full range of customer volume is included. The extreme values help separate signal from noise.
+
+
+MLM – Non-Retailers (<400 in 2023)
+AUC: 0.6604
+
+Plot: Gradual curve — modest lift above the 45° line
+
+Insight: This model is much more challenging — it's trying to detect subtle differences in low-volume customers who may or may not grow. That’s a smaller and murkier signal.
+
+
+You're asking a harder question in the MLM model: “Can we detect who grows from small 2023 volumes?”
+
+In contrast, the full GLM benefits from wider variation and clearer separability.
+
+
+Use both models:
+
+GLM on full data — Good for general segmentation, identifying clear high-performers and underperformers.
+
+MLM on <400 only — Targeted for identifying “sleepers” or Emerging Opportunities, even if performance is more modest.
+
+**could even build a pipeline**
+
+Use full GLM to tag high probability growers.
+
+For low-volume accounts, trigger MLM review to find “quiet risers.”
+
+Want to move to calibration or threshold analysis next for either of these?
+
+
+
+
+## Explore Order Type Effects
+You’ve already seen EDI and Sales Rep perform well across models. Let's:
+
+Visualize the growth rate within each order type.
+
+Consider interaction effects like FREQUENT_ORDER_TYPE * total_volume_2023_scaled.
+
+Build individual decision trees per order type for interpretability.
+
+```{r}
+
+# probabilities from your GLM model
+non_retailers_full$predicted_prob <- predict(glm_nonretail_all, type = "response")
+
+# 2. Create a new dataset for exploration
+order_type_preds <- non_retailers_full|>
+  select(FREQUENT_ORDER_TYPE, predicted_prob, exceeds_400_2024)
+
+
+# Bin predictions
+order_type_preds$prob_bin <- cut(order_type_preds$predicted_prob, 
+                                  breaks = seq(0, 1, by = 0.05), 
+                                  include.lowest = TRUE)
+
+# Plot: actual grower rate by order type across bins
+ggplot(order_type_preds, aes(x = prob_bin, fill = factor(exceeds_400_2024))) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ FREQUENT_ORDER_TYPE) +
+  labs(
+    title = "Calibration by Frequent Order Type",
+    x = "Predicted Probability (Binned)",
+    y = "Proportion of Growers",
+    fill = "Grew in 2024?"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+glm_nonretail_all <- glm(
+  exceeds_400_2024 ~ total_volume_2023_scaled + FREQUENT_ORDER_TYPE +
+    LOCAL_MARKET_PARTNER + CO2_CUSTOMER + distance_to_centroid_scaled,
+  data = non_retailers_full,
+  family = binomial
+)
+summary(glm_nonretail_all)
+
+# Predict probabilities
+predicted_probs_all <- predict(glm_nonretail_all, newdata = non_retailers_full, type = "response")
+test_y_all <- non_retailers_full$exceeds_400_2024
+
+# AUC + ROC
+roc_obj_all <- pROC::roc(response = test_y_all, predictor = predicted_probs_all)
+pROC::auc(roc_obj_all)
+plot(roc_obj_all, main = "ROC Curve: GLM Non-Retail (All Customers)")
+
+
+
+
+non_retailers_under400 <- non_retailers_full %>%
+  filter(total_volume_2023 < 400)
+
+glm_under400 <- glm(
+  exceeds_400_2024 ~ total_volume_2023_scaled + FREQUENT_ORDER_TYPE +
+    LOCAL_MARKET_PARTNER + CO2_CUSTOMER + distance_to_centroid_scaled,
+  data = non_retailers_under400,
+  family = binomial
+)
+
+summary(glm_under400)
+
+# Predict probabilities
+predicted_probs_under400 <- predict(glm_under400, newdata = non_retailers_under400, type = "response")
+test_y_under400 <- non_retailers_under400$exceeds_400_2024
+
+# AUC + ROC
+roc_obj_under400 <- pROC::roc(response = test_y_under400, predictor = predicted_probs_under400)
+pROC::auc(roc_obj_under400)
+plot(roc_obj_under400, main = "ROC Curve: GLM Non-Retail (<400 in 2023)")
+
+
+
+```
+Variable	Coefficient	p-value	Effect & Interpretation
+total_volume_2023_scaled  strong predictor of growth (as expected).
+
+FREQ_ORDER_TYPE: MYCOKE360	 Strongly increases odds of growth vs. CALL CENTER.
+
+FREQ_ORDER_TYPE: SALES REP	 positive predictor — reliable order type.
+
+FREQ_ORDER_TYPE: OTHER	 statistically significant positive effect.
+
+FREQ_ORDER_TYPE: MYCOKE LEGACY	 Not significant — effect may be noise or context-dependent.
+
+FREQ_ORDER_TYPE: EDI	likely unstable?
+
+>> when we dig into the non retailers only we get more specific results 
+
+**For non-retailers under 400, MYCOKE360 was the only significant order type — others trended in the same direction, but lacked significance likely due to smaller sample size.**
+ 
+**For retailers under 400, EDI was the standout signal, which is fascinating. Others again trended positive but were not statistically significant**
+
+
+ Use this to justify including more data
+If your model with all non-retailers:
+
+Shows better performance
+
+Retains predictive signals from order types
+
+Isn’t diluted by noise
+
+...then it's a great argument that limiting to <400 might be overly conservative.
+
+You could even simulate segmentation:
+
+Identify what percent of high 2023 volume customers still grew in 2024
+
+Compare predictive performance of high vs. low baseline volume groups
+
+
+
+Frequent Order Type is Robust
+MYCOKE360 and SALES REP are significant in both versions.
+
+OTHER is marginal but trends consistently.
+
+Legacy and EDI don’t show up as meaningful in this group.
+
+✅ Adding Full Data Strengthens Confidence
+Larger sample improves precision on estimates.
+
+CO2_CUSTOMER becomes significant only with full data, suggesting the under-400 sample may mask that effect.
+
+✅ Model Fit Improves
+You're getting a much stronger AUC with full data (~0.92 vs. ~0.66 from MLM).
+
+Your total_volume_2023 variable becomes even more powerful, and model performance benefits from the added variance.
+
+
+
+Interpretation So Far:
+AUC of 0.9221 is very high — but may be inflated because customers already performing well in 2023 are easy to predict as growing. So the model might be "cheating" by identifying existing good customers, not future risers.
+
+AUC of 0.6604 on under-400s is more valuable for Swire's strategic goal — identifying emerging growers, not just reliable performers.
+
+
+
+Retailers are much easier to predict — PRIMARY_GROUP_NUMBER (random effect) adds huge value. Consistent group behavior.
+
+Non-retailers have much more noise:
+
+GLM and MLM perform identically on under-400 group (AUC = 0.6604), so cluster doesn’t help — likely because there’s less structure across the clusters.
+
+But including all non-retailers drastically improves AUC (0.9221), suggesting you’re just picking up on already strong performers.
+
+Most actionable model for Swire = probably the GLM for non-retailers <400 in 2023, since it directly answers:
+
+“Which small customers might grow?”
+
+
+
+
+
+
+
+
+## Improve Thresholding Strategy
+Your current threshold (e.g., 400 gallons) might be too rigid. Instead:
+
+Visualize total_volume_2024 vs. total_volume_2023 to find natural breakpoints (e.g., growth of +100 gallons, % change).
+
+Use decision tree splits to detect organic thresholds.
+
+Try defining “growth” using percent increase or clustering approaches (e.g., k-means on growth rates).
+
+
+
+Rather than dropping customers under 400 gallons in 2023:
+
+Include them and weight observations based on total_volume_2023 (or use it as a predictor).
+
+Or create a new response variable like:
+growth_category = case_when(volume_change < 0 ~ "declined", between(volume_change, 0, 100) ~ "flat", volume_change > 100 ~ "grew")
+```{r}
+
+```
+
+
+
+5. Consistent Performers
+For high-value analysis:
+
+Filter customers with >=1000 gallons in both 2023 and 2024.
+
+Profile these accounts: What % are CO₂ customers? What’s their order method? Are they LMP?
+
+Segment by stability + volume: maybe a 2x2 of “Reliable High Volume” vs. “Volatile Low Volume” etc.
+
+```{r}
+
+```
+
+
+
+# Threshold simualtion DRAFT
+
+Want to know how many customers you'd "protect" at different cutoffs?
+
+```{r}
+
+model_used <- model.frame(glm_combined)
+model_used$predicted_prob <- predicted_probs
+
+# Flag top 25% most likely to grow
+threshold_75 <- quantile(model_used$predicted_prob, 0.75)
+model_used <- model_used |>
+  mutate(flag_high_growth = predicted_prob >= threshold_75)
+
+# Summarize impact
+model_used |>
+  summarise(
+    flagged = sum(flag_high_growth),
+    actual_growers = sum(exceeds_400_2024 == 1 & flag_high_growth),
+    actual_growth_rate_flagged = mean(exceeds_400_2024[flag_high_growth == 1])
+  )
+
+# could get something to say somethig like: “If Swire protects the top 25% of sub-400 customers (based on predicted growth risk), they retain X high-value customers and avoid false ARTM assignments in Y% of cases.”
+
+```
+
+
+
+
+
+
+
+
+other random effects to explore: is this variable describing a group of customers that might influence outcomes? trade channel or sub trade chennel. frequent order type
+
+re confirm why we only use the data of those below 400 in 23, what if we use all the data? or only the good performing customers - really want to think through the reasoning on this one. 
+
+
+
+Good Questions MLMs Can Help You Answer
+Here’s a menu of questions that MLMs are uniquely positioned to handle:
+
+1. “Do some retailer groups consistently outperform others?”
+→ Use (1 | PRIMARY_GROUP_NUMBER)
+
+2. “Does local variation (e.g., location or cluster) affect performance?”
+→ Use (1 | cluster) — we saw this wasn't significant
+
+3. “Are fixed predictors (like CO2 or volume) more or less important in different contexts?”
+→ Try interactions with group status
+
+4. “Can we identify which groups we should focus ARTM changes on?”
+→ Use predicted probabilities and random effect estimates
+
+
+
+Here’s what I’d love to know from you to guide our modeling roadmap:
+
+Are there subgroups Swire is especially concerned about? yes they want us to look at local market partners that dont order co2. 
+
+E.g., LMPs without CO2? Small retailers?
+
+Is there any team structure in how customers are serviced? - not included in our data
+
+E.g., sales rep, territory, distributor?
+
+Do we care more about predicting individual growth, or understanding group variation? - they want to know what kinds of customers are poised to grow, what kind of chracteristics to keep an eye on to make sure current low volume are not moved to ARTM if they will be high volume in future
+
+Would Swire want to simulate what happens if certain segments stay red truck vs. go ARTM? - sure? 
+
+(We can use predicted probabilities for this!)
+
+
