@@ -5,13 +5,13 @@ The goal of this project was to utilize Swire’s customer data to develop a sys
 
 # FILE OVERVIEW
 
-# - Exploratory Data Analysis (EDA):
+# Exploratory Data Analysis (EDA):
  Key findings included:
  • Uneven distribution between red truck and white truck customers
  • Customers tended to fall into a few clear geographic clusters
  • Substantial variation in traits such as cold drink channel status and local market partner designation
 
-# - Modeling Work:
+# Modeling Work:
 • Multiple RMarkdown files document my attempts to predict which customers will cross the 400-gallon threshold in 2024
 • I explored both GLMs and multilevel models (with random effects by segment or retailer)
 • A key challenge was the wide variation in order volumes, which made it difficult to isolate consistently predictive features
@@ -23,8 +23,5 @@ This repo reflects my individual contributions and experimentation outside the f
 
 For the final presentation and group work, refer to the separate project submission files.
 
-# -------------------------
 # AUTHOR
-# -------------------------
-# Imogen Holdsworth
-# University of Utah, MSBA – Spring 2025
+Imogen Holdsworth University of Utah, MSBA – Spring 2025
