@@ -12,16 +12,21 @@ The goal of this project was to utilize Swire’s customer data to develop a sys
  - Substantial variation in traits such as cold drink channel status and local market partner designation
 
 # Modeling Work:
-• Multiple RMarkdown files document my attempts to predict which customers will cross the 400-gallon threshold in 2024
-• I explored both GLMs and multilevel models (with random effects by segment or retailer)
-• A key challenge was the wide variation in order volumes, which made it difficult to isolate consistently predictive features
-• Segmenting customers by retailer and performance group helped improve model fit
+- Multiple RMarkdown files document my attempts to predict which customers will cross the 400-gallon threshold in 2024
+- I explored both GLMs and multilevel models (with random effects by segment or retailer)
+- A key challenge was the wide variation in order volumes, which made it difficult to isolate consistently predictive features
+- Segmenting customers by retailer and performance group helped improve model fit
 
-# NOTES
+# Takeaways
+- Developed and implemented multilevel models and logistic regression in R.
+- Applied customer segmentation logic, accounting for growth patterns, economic factors, and group level variation.
+- Balanced technical modeling with business framing to ensure a presentation that focused on business impact.
+- Practice real world problem application of predictive and explanatory models to help guide business decisions. 
 
+# Notes
 This repo reflects my individual contributions and experimentation outside the final team deliverables. It includes trial runs, personal notes, and versions of models I tested on my own. 
 
 For the final presentation and group work, refer to the separate project submission files.
 
 # AUTHOR
-Imogen Holdsworth University of Utah, MSBA – Spring 2025
+Imogen Holdsworth University of Utah, MSBA Spring 2025
