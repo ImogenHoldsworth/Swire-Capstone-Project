@@ -7,9 +7,9 @@ The goal of this project was to utilize Swire’s customer data to develop a sys
 
 # Exploratory Data Analysis (EDA):
  Key findings included:
- • Uneven distribution between red truck and white truck customers
- • Customers tended to fall into a few clear geographic clusters
- • Substantial variation in traits such as cold drink channel status and local market partner designation
+ - Uneven distribution between red truck and white truck customers
+ - Customers tended to fall into a few clear geographic clusters
+ - Substantial variation in traits such as cold drink channel status and local market partner designation
 
 # Modeling Work:
 • Multiple RMarkdown files document my attempts to predict which customers will cross the 400-gallon threshold in 2024
