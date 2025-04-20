@@ -1,32 +1,49 @@
 # Swire Capstone: Customer Growth Modeling
-This repo contains my personal work for the Swire Coca-Cola Capstone Project (Spring 2025, Group 2 - University of Utah MSBA Program).
+This repo contains my personal work for the Swire Coca-Cola Capstone Project (Spring 2025, Group 2, University of Utah MSBA Program).
 
-The goal of this project was to utilize Swire’s customer data to develop a systematic method  to identify and classify threshold or emerging customers who are approaching key volume thresholds. The primary objective was to ensure that future high volume customers are not prematurely shifted to an alternate route to market (white truck), and instead are supported to grow through Swire’s internal red truck delivery service.
+# Summary of Business Problem & Project Objective
 
-# FILE OVERVIEW
+Swire Coca-Cola serves a large number of customers, but some do not order enough volume  to make internal delivery (red truck) cost-effective. Currently, Swire doesn’t have a systematic method for identifying which low-volume customers are on a growth trajectory and should be retained on the red truck route.
 
-# Exploratory Data Analysis (EDA):
- Key findings included:
- - Uneven distribution between red truck and white truck customers
- - Customers tended to fall into a few clear geographic clusters
- - Substantial variation in traits such as cold drink channel status and local market partner designation
+The objective of this project was to use customer data to identify potential and emerging customers who are approaching key volume thresholds (e.g., 400 gallons/year). By identifying these accounts, Swire can avoid prematurely transitioning high-potential customers to white truck delivery and instead nurture their growth internally.
 
-# Modeling Work:
-- Multiple RMarkdown files document my attempts to predict which customers will cross the 400-gallon threshold in 2024
-- I explored both GLMs and multilevel models (with random effects by segment or retailer)
-- A key challenge was the wide variation in order volumes, which made it difficult to isolate consistently predictive features
-- Segmenting customers by retailer and performance group helped improve model fit
+# Group Solution
+We approached the problem through data segmentation and predictive modeling. 
+Our steps included:
+- Exploratory data analysis to understand customer behavior and traits
+- Building logistic regression and multilevel models to predict which customers would surpass the 400-gallon threshold in 2024
+- Creating customer segments based on order trends and growth patterns
+- Proposing a framework to guide future delivery routing and retention strategy
 
-# Takeaways
-- Developed and implemented multilevel models and logistic regression in R.
-- Applied customer segmentation logic, accounting for growth patterns, economic factors, and group level variation.
-- Balanced technical modeling with business framing to ensure a presentation that focused on business impact.
-- Practice real world problem application of predictive and explanatory models to help guide business decisions. 
+# My Contribution to the Project
+This repo contains my personal work, including:
+- Exploratory data analysis to investigate customer distribution, location clusters, and key traits.
+- Data cleaning and file joining.
+- Developing and refining logistic and multilevel models to predict growth on Retailer customers. 
+- Identifying challenges in modeling customer volume due to wide variance for Retailer customers. 
+- Testing different segmentation approaches to improve model performance for Retailer customers.
+- Develop visual presentation and narrative for business solution. 
 
-# Notes
-This repo reflects my individual contributions and experimentation outside the final team deliverables. It includes trial runs, personal notes, and versions of models I tested on my own. 
+# Business Value of the Solution
+ This project provides Swire with a data-driven framework to:
+- Protect future profitable customers by identifying them early
+- Make more confident routing decisions based on predicted performance
+- Improve operational efficiency by aligning delivery method with customer potential
 
-For the final presentation and group work, refer to the separate project submission files.
+# Difficulties Encountered
+- Customer volume data was right highly skewed, making modeling and interpretation tricky
+- Many traits (like delivery channel or partner status) were sparse or unevenly distributed, and mostly statistically insignficant
+- It was difficult to isolate features that consistently drove high order volume
+- Choosing the right balance between model complexity and interpretability was an ongoing challenge
+- Limited historical order data made it difficult to build and test predictivite capability of the models.
 
-# AUTHOR
-Imogen Holdsworth University of Utah, MSBA Spring 2025
+# What I Learned
+- How to use multilevel modeling to account for group-level effects (retailers and customer segments)
+- The importance of thoughtful customer segmentation in model performance
+- How to clean and analyze real-world, messy data
+- How to translate predictive model output into actionable business insights
+- How to present findings to real stake holders
+- How to work alongside others to ensure goals are met
+
+# Author
+Imogen Holdsworth University of Utah, MSBA – Spring 2025
