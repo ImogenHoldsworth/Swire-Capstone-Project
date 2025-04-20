@@ -1,0 +1,1723 @@
+---
+title: "Modeling Phase 2"
+author: "Imogen"
+date: "2025-03-16"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+    toc_float: yes # makes the toc move along
+    code_folding: "show"  # Use "hide" to collapse code by default
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r}
+pacman::p_load(tidyverse, scales, dplyr, corrr, janitor, tidyr, psych, readr, lubridate, rpart, rpart.plot, caret, C50, sf, maps, dbscan, geosphere, nnet, randomForest,readxl,Metrics,pROC)
+```
+
+# Load Orignal Data
+```{r}
+CustomerProfileData <- read.csv("/Users/u0847758/Desktop/CAP/customer_profile.csv")  
+TransactionalData <- read.csv("/Users/u0847758/Desktop/CAP/transactional_data (1).csv")
+AddressZipData <- read.csv("/Users/u0847758/Desktop/CAP/customer_address_and_zip_mapping.csv")
+DeliveryCostData <- read_excel("/Users/u0847758/Desktop/CAP/delivery_cost_data (1).xlsx")
+```
+
+# First Round Cleaning
+
+## Clean Address Data
+
+## Address Data Cleaning
+* break address data into seperate columns
+* change lat and long to numeric
+```{r}
+#clean the address data
+# Split the column
+AddressZipData <- AddressZipData |>
+  separate(full.address, into = c("ZIP", "City", "State Name", "State Short", 
+                                  "County","Code", "Latitude", "Longitude"), sep = ",")
+
+AddressZipData$Latitude <- as.numeric(AddressZipData$Latitude)
+
+AddressZipData$Longitude <- as.numeric(AddressZipData$Longitude)
+```
+
+## Transactional Data Cleaning
+
+```{r}
+TransactionalData$TRANSACTION_DATE <- mdy(TransactionalData$TRANSACTION_DATE)
+  
+TransactionalData <- TransactionalData %>% 
+  mutate(Quarter_column = quarter(TRANSACTION_DATE), 
+         Quarter_year = paste(Quarter_column, YEAR, sep = " "),
+         MONTH = month(TRANSACTION_DATE)) %>% 
+  select(-c(LOADED_CASES, DELIVERED_CASES, LOADED_GALLONS, DELIVERED_GALLONS))
+```
+
+## Customer Profile Data Cleaning
+
+* Added Entity ID to look at customers with outlet all together
+* clean date format
+* convert character columns to factors
+* convert logical columns to 0/1 - for easier modeling later
+* filter out the one customer that has a first delivery date before they were on boarded
+```{r}
+#clean Customer Profile Data
+  CustomerProfileData <-  CustomerProfileData %>% 
+  mutate(
+    Entity_ID = case_when(
+      is.na(PRIMARY_GROUP_NUMBER) ~ CUSTOMER_NUMBER,  # If PRIMARY_GROUP_NUMBER is NA, use CUSTOMER_NUMBER
+      TRUE ~ PRIMARY_GROUP_NUMBER),
+    ON_BOARDING_DATE = mdy(ON_BOARDING_DATE),
+    FIRST_DELIVERY_DATE = mdy(FIRST_DELIVERY_DATE),
+    ON_BOARDING_YEAR = year(ON_BOARDING_DATE),
+    FIRST_DELIVERY_YEAR = year(FIRST_DELIVERY_DATE))
+
+char_col <- sapply(CustomerProfileData, is.character)
+CustomerProfileData[char_col] <- lapply(CustomerProfileData[char_col], as.factor)
+
+logical_cols <- sapply(CustomerProfileData, is.logical)
+CustomerProfileData[logical_cols] <- lapply(CustomerProfileData[logical_cols], as.numeric)
+
+#remove the customer where their on_boarding date was first delivery date was before the onboarding date (1 customer)
+CustomerProfileData <- CustomerProfileData %>% 
+  filter(FIRST_DELIVERY_DATE>=ON_BOARDING_DATE)
+```
+
+
+## Annual Aggregated Transactionl Data
+
+```{r}
+#Pivot wide the cost data
+#aggregated  transaction data to join to customer table
+
+# aggregate transaction data by customer_number and year
+#sum the ordered cases and gallons by customer number and year
+#this table is set up so each customer number has  two rows, one for 2023, one for 2024. Each column is sum of ordered cases/loaded cases. delivered cases in that year 
+aggregated_cost <- TransactionalData |>
+  group_by(CUSTOMER_NUMBER, YEAR) |>
+  summarize(orderedCases = sum(ORDERED_CASES),
+            orderedGallons = sum(ORDERED_GALLONS))
+
+
+
+#The code pivots the database above to have one row per customer and a column for each cases/gallons ordered for each year
+aggregated_cost_wide <- aggregated_cost |>
+  pivot_wider(
+    names_from = YEAR, 
+    values_from = c(orderedCases, 
+                    orderedGallons),
+    names_sep = "_"
+  )
+```
+
+
+## Location Clustering
+
+```{r}
+CustomerProfile_Location <- CustomerProfileData %>% 
+  left_join(AddressZipData, by = c("ZIP_CODE"="zip")) 
+```
+
+* do KMeans clustering to identify the four main location clusters
+* identify the center (Centroid) of each of the four main clusters
+```{r}
+#cluster the addresses and calculate the centroid for each cluster
+##Multiple centroids
+set.seed(123)
+
+kmeans_result <- kmeans(CustomerProfile_Location[,c("Longitude", "Latitude")], centers = 4)
+
+CustomerProfile_Location$cluster <- as.factor(kmeans_result$cluster)
+
+
+centroids <- CustomerProfile_Location %>% 
+  group_by(cluster) %>% 
+  summarize(centroid_lon = mean(Longitude), centroid_lat = mean(Latitude))
+
+```
+
+
+* Calculate the miles distance of each customers location to the centroid
+```{r}
+
+haversine_distance <- function(lon1, lat1, lon2, lat2) {
+  distHaversine(c(lon1, lat1), c(lon2,lat2))/1609.34 
+}# converts meters to miles
+
+#Join main customer data to the clusters created above
+CustomerProfile_Location <- CustomerProfile_Location %>% 
+  left_join(centroids, by = "cluster")
+
+
+CustomerProfile_Location <- CustomerProfile_Location %>% 
+  mutate(
+    distance_to_centroid = mapply(haversine_distance, CustomerProfile_Location$Longitude, CustomerProfile_Location$Latitude, CustomerProfile_Location$centroid_lon, CustomerProfile_Location$centroid_lat)
+  )
+
+```
+
+
+# Annual Customer No Retailer
+```{r}
+Annual_Customer_No_Retailer <- CustomerProfile_Location %>% 
+  left_join(aggregated_cost_wide, by = "CUSTOMER_NUMBER") %>% 
+  mutate(across(c(orderedCases_2023, orderedCases_2024, orderedGallons_2023, orderedGallons_2024), ~ replace_na(.x, 0)),
+         total_ordered = (orderedCases_2024 + orderedGallons_2024 +orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2023 = (orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2024 = (orderedCases_2024 + orderedGallons_2024)) %>% 
+  filter(!(year(FIRST_DELIVERY_DATE) == 2023 & orderedCases_2023 == 0 & orderedGallons_2023 == 0) &
+    !(year(FIRST_DELIVERY_DATE) == 2024 & orderedCases_2024 == 0 & orderedGallons_2024 == 0)) %>% 
+  filter(!(total_ordered_2023 ==0 & total_ordered_2024 == 0))
+
+Annual_Customer_No_Retailer <-  Annual_Customer_No_Retailer |>
+  filter(is.na(PRIMARY_GROUP_NUMBER))
+# filtering out the retail customers here
+
+
+
+```
+
+
+```{r}
+Annual_Customer_No_Retailer <- Annual_Customer_No_Retailer %>% 
+  group_by(Entity_ID) %>% 
+  summarize(FREQUENT_ORDER_TYPE = FREQUENT_ORDER_TYPE[which.max(tabulate(match(FREQUENT_ORDER_TYPE, unique(FREQUENT_ORDER_TYPE))))],
+            COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+            TRADE_CHANNEL = first(TRADE_CHANNEL),
+            SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+            FIRST_DELIVERY_DATE = min(FIRST_DELIVERY_DATE),
+            FIRST_DELIVERY_YEAR = min(FIRST_DELIVERY_YEAR),
+            ON_BOARDING_DATE = min(ON_BOARDING_DATE),
+            ON_BOARDING_YEAR = min(ON_BOARDING_YEAR),
+            customer_age = as.numeric(format(Sys.Date(), "%Y")) - ON_BOARDING_YEAR,
+            #hasOutlets = case_when(is.na(PRIMARY_GROUP_NUMBER)~ 0,TRUE ~1), # i made a change here
+            LOCAL_MARKET_PARTNER = LOCAL_MARKET_PARTNER[which.max(tabulate(match(LOCAL_MARKET_PARTNER,unique(LOCAL_MARKET_PARTNER))))],
+            CO2_CUSTOMER =  CO2_CUSTOMER[which.max(tabulate(match(CO2_CUSTOMER, unique(CO2_CUSTOMER))))],
+            
+            hasOrderedCases = as.integer(mean(case_when((orderedCases_2023 + orderedCases_2024)>0 ~1, TRUE ~ 0))>0,1,TRUE~0),
+            
+            propCases = sum(orderedCases_2023, orderedCases_2024)/ sum(total_ordered),
+ 
+            zip_code =  first(ZIP), 
+            
+            city =  first(City),
+
+            state =   
+              first(`State Name`), 
+
+            region = first(cluster),
+             
+            distance_from_centroid = first(distance_to_centroid),
+
+            total_ordered_2023 = sum(total_ordered_2023),
+            total_ordered_2024 = sum(total_ordered_2024),
+            percentChangeYOY = ((total_ordered_2024) - (total_ordered_2023))/(total_ordered_2023)) %>% 
+  mutate(Binning_column = case_when(
+    (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY < 0.10 ~ "low volume low growth",
+         (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY > 0.10 ~ "low volume high growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY < 0.05 ~ "high volume low growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY > 0.05 ~ "high volume high growth",
+         (total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY > 0 ~ "transtionary growing ",
+         (total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY < 0 ~ "transitionary declining" ))
+
+```
+
+
+# Annual Customer Data Retailer
+```{r}
+Annual_Customer_Retailer <- CustomerProfile_Location %>% 
+  left_join(aggregated_cost_wide, by = "CUSTOMER_NUMBER") %>% 
+  mutate(across(c(orderedCases_2023, orderedCases_2024, orderedGallons_2023, orderedGallons_2024), ~ replace_na(.x, 0)),
+         total_ordered = (orderedCases_2024 + orderedGallons_2024 +orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2023 = (orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2024 = (orderedCases_2024 + orderedGallons_2024)) %>% 
+  filter(!(year(FIRST_DELIVERY_DATE) == 2023 & orderedCases_2023 == 0 & orderedGallons_2023 == 0) &
+    !(year(FIRST_DELIVERY_DATE) == 2024 & orderedCases_2024 == 0 & orderedGallons_2024 == 0))
+
+# Imogen update, filtering out the NA for primary group here, rather than filtering for more than one outlet 
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  filter(!is.na(PRIMARY_GROUP_NUMBER))
+
+
+```
+
+```{r}
+Annual_Customer_Retailer <- Annual_Customer_Retailer %>% 
+  group_by(Entity_ID) %>% 
+    mutate(across(c(orderedCases_2023, orderedCases_2024, orderedGallons_2023, orderedGallons_2024), ~ replace_na(.x, 0)),
+         total_ordered = (orderedCases_2024 + orderedGallons_2024 +orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2023 = (orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2024 = (orderedCases_2024 + orderedGallons_2024)) %>% 
+  group_by(Entity_ID) %>% 
+  summarize(FREQUENT_ORDER_TYPE = FREQUENT_ORDER_TYPE[which.max(tabulate(match(FREQUENT_ORDER_TYPE, unique(FREQUENT_ORDER_TYPE))))],
+            COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+            TRADE_CHANNEL = first(TRADE_CHANNEL),
+            SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+            FIRST_DELIVERY_DATE = min(FIRST_DELIVERY_DATE),
+            FIRST_DELIVERY_YEAR = min(FIRST_DELIVERY_YEAR),
+            ON_BOARDING_DATE = min(ON_BOARDING_DATE),
+            ON_BOARDING_YEAR = min(ON_BOARDING_YEAR),
+            customer_age = as.numeric(format(Sys.Date(), "%Y")) - ON_BOARDING_YEAR,
+            
+            LOCAL_MARKET_PARTNER = LOCAL_MARKET_PARTNER[which.max(tabulate(match(LOCAL_MARKET_PARTNER,unique(LOCAL_MARKET_PARTNER))))],
+            CO2_CUSTOMER =  CO2_CUSTOMER[which.max(tabulate(match(CO2_CUSTOMER, unique(CO2_CUSTOMER))))],
+            hasOutlet = first(case_when(is.na(PRIMARY_GROUP_NUMBER)~ 0,TRUE ~1)),
+           # numberOfOutlets = sum(case_when(is.na(PRIMARY_GROUP_NUMBER)~ 1,TRUE ~1)), 
+           # that code was not actually counting the number of distinct customer ids associated with an entity
+           numberOfOutlets = n_distinct(CUSTOMER_NUMBER), # this should corrent that
+            #wellPerformingOutlet = sum(case_when((orderedGallons_2023 + orderedCases_2023) >= 400 ~ 1, (orderedGallons_2024 + orderedCases_2024) >=400 ~ 1, TRUE ~ 0)),
+           # that line needed to be changed too, because we are grouping by entity ID and we want to know within the entity ID group what number of customers a part of the same primary group are well performing - just wanted to use distinct to be sure 
+           wellPerformingOutlet = n_distinct(CUSTOMER_NUMBER[(orderedCases_2023 + orderedGallons_2023 >= 400) |
+  (orderedCases_2024 + orderedGallons_2024 >= 400)]),
+            hasOrderedCases = as.integer(mean(case_when((orderedCases_2023 + orderedCases_2024)>0 ~1, TRUE ~ 0))>0,1,TRUE~0),
+            
+            propCases = sum(orderedCases_2023, orderedCases_2024)/ sum(total_ordered),
+            
+            GeoSpread = n_distinct(ZIP),
+            most_common_zip = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(ZIP),
+              ZIP[which.max(tabulate(match(ZIP, unique(ZIP))))]), 
+            largest_zip = if_else(
+              numberOfOutlets == 1,
+              first(ZIP),
+              ZIP[which.max(total_ordered)]
+            ),
+            
+            most_common_city = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(City),
+              City[which.max(tabulate(match(City, unique(City))))]), 
+            largest_city = if_else(
+              numberOfOutlets == 1,
+              first(City),
+              City[which.max(total_ordered)]
+            ),
+            
+            most_common_state = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(`State Name`),
+              `State Name`[which.max(tabulate(match(`State Name`, unique(`State Name`))))]), 
+            largest_state = if_else(
+              numberOfOutlets == 1,
+              first(`State Name`),
+              `State Name`[which.max(total_ordered)]
+            ),
+            
+            most_common_region = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(cluster),
+              cluster[which.max(tabulate(match(cluster, unique(cluster))))]), 
+            largest_region = if_else(
+              numberOfOutlets == 1,
+              first(cluster),
+              cluster[which.max(total_ordered)]
+            ),
+            
+            most_common_distance = if_else(
+              numberOfOutlets == 1,  # If only one location, take that ZIP
+              first(distance_to_centroid),
+              distance_to_centroid[which.max(tabulate(match(distance_to_centroid, unique(distance_to_centroid))))]), 
+            
+            largest_distance = if_else(
+              numberOfOutlets == 1,
+              first(distance_to_centroid),
+              distance_to_centroid[which.max(total_ordered)]
+            ),
+            
+                        
+            avg_distance = if_else(
+              numberOfOutlets == 1,
+              first(distance_to_centroid),
+              mean(distance_to_centroid)
+            ),
+            total_ordered_2023 = sum(total_ordered_2023),
+            total_ordered_2024 = sum(total_ordered_2024),
+            percentChangeYOY = ((total_ordered_2024) - (total_ordered_2023))/(total_ordered_2023))%>% 
+  mutate(Binning_column = case_when(
+    (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY < 0.10 ~ "low volume low growth",
+         (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY > 0.10 ~ "low volume high growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY < 0.05 ~ "high volume low growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY > 0.05 ~ "high volume high growth",
+         (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY > 0 ~ "transtionary growing ",
+         (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY < 0 ~ "transitionary declining" )) 
+
+#%>% 
+  #filter(numberOfOutlets > 1) # commenting this out here as i filtered for where primary group is NA
+```
+
+
+#  Unaggregated Dates Customer Data No Retailer
+
+```{r}
+aggregated_cost_by_month <- TransactionalData |>
+  group_by(CUSTOMER_NUMBER, YEAR, Quarter_column, Quarter_year,MONTH) |>
+  summarize(orderedCases = sum(ORDERED_CASES),
+            orderedGallons = sum(ORDERED_GALLONS),
+            totalOrdered = sum(ORDERED_CASES, ORDERED_GALLONS))
+```
+
+
+```{r}
+UnaggregatedDates_Customer_No_Retailer <- CustomerProfile_Location %>% 
+  left_join(aggregated_cost_by_month, by = "CUSTOMER_NUMBER") %>% 
+   mutate(across(c(orderedCases, orderedGallons, totalOrdered), ~ replace_na(.x, 0))) 
+  
+```
+
+*create rows for each month
+```{r}
+all_months <- crossing(
+  CUSTOMER_NUMBER = unique(UnaggregatedDates_Customer_No_Retailer$CUSTOMER_NUMBER),
+  YEAR = unique(UnaggregatedDates_Customer_No_Retailer$YEAR, na.rm = TRUE),
+  MONTH = 1:12
+) %>%
+  mutate(
+    Quarter_column = case_when(
+      MONTH >= 1 & MONTH <= 3 ~ 1,
+      MONTH >= 4 & MONTH <= 6 ~ 2,
+      MONTH >= 7 & MONTH <= 9 ~ 3,
+      TRUE ~ 4
+    ),
+    Quarter_year = paste(Quarter_column, YEAR, sep = " ")
+  ) %>% filter(!is.na(YEAR) )
+
+# First, create a customer reference dataset with one row per customer
+customer_reference <- UnaggregatedDates_Customer_No_Retailer %>%
+  group_by(CUSTOMER_NUMBER) %>%
+  summarize(
+    PRIMARY_GROUP_NUMBER = first(PRIMARY_GROUP_NUMBER),
+    FREQUENT_ORDER_TYPE = first(FREQUENT_ORDER_TYPE),
+    FIRST_DELIVERY_DATE = first(FIRST_DELIVERY_DATE),
+    ON_BOARDING_DATE = first(ON_BOARDING_DATE),
+    COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+    TRADE_CHANNEL = first(TRADE_CHANNEL),
+    SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+    LOCAL_MARKET_PARTNER = first(LOCAL_MARKET_PARTNER),
+    CO2_CUSTOMER = first(CO2_CUSTOMER),
+    ZIP_CODE = first(ZIP_CODE),
+    Entity_ID = first(Entity_ID),
+    ON_BOARDING_YEAR = first(ON_BOARDING_YEAR),
+    FIRST_DELIVERY_YEAR = first(FIRST_DELIVERY_YEAR),
+    ZIP = first(ZIP),
+    City = first(City),
+    `State Name` = first(`State Name`),
+    Latitude = first(Latitude),
+    Longitude = first(Longitude),
+    cluster = first(cluster),
+    distance_to_centroid = first(distance_to_centroid)
+  )
+
+# Now join the transactions with all_months first, then join with customer reference
+UnaggregatedDates_Customer_No_Retailer <- all_months %>%
+  left_join(
+    UnaggregatedDates_Customer_No_Retailer %>% 
+      select(CUSTOMER_NUMBER, YEAR, MONTH, Quarter_column, Quarter_year, orderedCases, orderedGallons, totalOrdered),
+    by = c("CUSTOMER_NUMBER", "YEAR", "MONTH")
+  ) %>%
+  mutate(across(c(orderedCases, orderedGallons, totalOrdered), ~ replace_na(.x, 0))) %>%
+  # Join with the customer reference data
+  left_join(customer_reference, by = "CUSTOMER_NUMBER")
+```
+
+
+```{r}
+BYMONTH_Customer_No_Retailer <- UnaggregatedDates_Customer_No_Retailer %>% 
+  filter(is.na(PRIMARY_GROUP_NUMBER)) %>% 
+  group_by(Entity_ID, YEAR, MONTH) %>% 
+  summarize(
+    FREQUENT_ORDER_TYPE = first(FREQUENT_ORDER_TYPE),  # simplified
+    COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+    TRADE_CHANNEL = first(TRADE_CHANNEL),
+    SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+    FIRST_DELIVERY_DATE = min(FIRST_DELIVERY_DATE),
+    FIRST_DELIVERY_YEAR = min(FIRST_DELIVERY_YEAR),
+    ON_BOARDING_DATE = min(ON_BOARDING_DATE),
+    ON_BOARDING_YEAR = min(ON_BOARDING_YEAR),
+    customer_age = as.numeric(format(Sys.Date(), "%Y")) - min(ON_BOARDING_YEAR),
+            
+    LOCAL_MARKET_PARTNER = first(LOCAL_MARKET_PARTNER),  # simplified
+    CO2_CUSTOMER = first(CO2_CUSTOMER),  # simplified
+    
+    hasOrderedCases = as.integer(sum(orderedCases) > 0),
+            
+    propCases = sum(orderedCases) / sum(totalOrdered),
+    
+    zip_code = first(ZIP), 
+    city = first(City),
+    state = first(`State Name`), 
+    region = first(cluster),
+    distance_from_centroid = first(distance_to_centroid),
+    
+    orderedCases = sum(orderedCases),
+    orderedGallons = sum(orderedGallons),
+    totalOrdered = sum(totalOrdered)) 
+
+```
+
+
+Need to replace propcases Nan because there is nothing
+Also not sure if because the Q and M/Y columns are seperate how we will do with the time series?
+predict total ordered for the next period
+create bins column to say if they met target/or our threshbins
+
+```{r}
+BYQUARTER_Customer_No_Retailer <- UnaggregatedDates_Customer_No_Retailer %>% 
+  filter(is.na(PRIMARY_GROUP_NUMBER)) %>% 
+  group_by(Entity_ID, Quarter_year.x) %>% 
+  summarize(
+    FREQUENT_ORDER_TYPE = FREQUENT_ORDER_TYPE[which.max(tabulate(match(FREQUENT_ORDER_TYPE, unique(FREQUENT_ORDER_TYPE))))],
+    COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+    TRADE_CHANNEL = first(TRADE_CHANNEL),
+    SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+    FIRST_DELIVERY_DATE = min(FIRST_DELIVERY_DATE),
+    FIRST_DELIVERY_YEAR = min(FIRST_DELIVERY_YEAR),
+    ON_BOARDING_DATE = min(ON_BOARDING_DATE),
+    ON_BOARDING_YEAR = min(ON_BOARDING_YEAR),
+    customer_age = as.numeric(format(Sys.Date(), "%Y")) - ON_BOARDING_YEAR,
+            
+    LOCAL_MARKET_PARTNER = LOCAL_MARKET_PARTNER[which.max(tabulate(match(LOCAL_MARKET_PARTNER,unique(LOCAL_MARKET_PARTNER))))],
+    CO2_CUSTOMER =  CO2_CUSTOMER[which.max(tabulate(match(CO2_CUSTOMER, unique(CO2_CUSTOMER))))],
+    
+    hasOrderedCases = as.integer(case_when((orderedCases)>0 ~1, TRUE ~ 0)),
+            
+    propCases = sum(orderedCases)/ sum(totalOrdered),
+    
+    zip_code =  first(ZIP), 
+            
+    city =  first(City),
+
+    state =  first(`State Name`), 
+
+    region = first(cluster),
+             
+    distance_from_centroid = first(distance_to_centroid),
+    orderedCases = sum(orderedCases),
+    orderedGallons = sum(orderedGallons),
+    totalOrdered = sum(totalOrdered)) 
+
+```
+
+## By month retailer:
+```{r}
+BYMONTH_Customer_Retailer <- UnaggregatedDates_Customer_No_Retailer %>% 
+  filter(!is.na(PRIMARY_GROUP_NUMBER)) %>% 
+  group_by(Entity_ID, YEAR, MONTH) %>% 
+  summarize(
+    FREQUENT_ORDER_TYPE = first(FREQUENT_ORDER_TYPE),  # simplified
+    COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+    TRADE_CHANNEL = first(TRADE_CHANNEL),
+    SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+    FIRST_DELIVERY_DATE = min(FIRST_DELIVERY_DATE),
+    FIRST_DELIVERY_YEAR = min(FIRST_DELIVERY_YEAR),
+    ON_BOARDING_DATE = min(ON_BOARDING_DATE),
+    ON_BOARDING_YEAR = min(ON_BOARDING_YEAR),
+    customer_age = as.numeric(format(Sys.Date(), "%Y")) - min(ON_BOARDING_YEAR),
+            
+    LOCAL_MARKET_PARTNER = first(LOCAL_MARKET_PARTNER),  # simplified
+    CO2_CUSTOMER = first(CO2_CUSTOMER),  # simplified
+    
+    hasOrderedCases = as.integer(sum(orderedCases) > 0),
+            
+    propCases = sum(orderedCases) / sum(totalOrdered),
+    
+    zip_code = first(ZIP), 
+    city = first(City),
+    state = first(`State Name`), 
+    region = first(cluster),
+    distance_from_centroid = first(distance_to_centroid),
+    
+    orderedCases = sum(orderedCases),
+    orderedGallons = sum(orderedGallons),
+    totalOrdered = sum(totalOrdered)) 
+```
+
+## by quarter retailer: 
+
+```{r}
+BYQUARTER_Customer_Retailer <- UnaggregatedDates_Customer_No_Retailer %>% # can use this data bc it did not yet filter out parentid
+  filter(!is.na(PRIMARY_GROUP_NUMBER)) %>% 
+  group_by(Entity_ID, Quarter_year.x) %>% 
+  summarize(
+    FREQUENT_ORDER_TYPE = FREQUENT_ORDER_TYPE[which.max(tabulate(match(FREQUENT_ORDER_TYPE, unique(FREQUENT_ORDER_TYPE))))],
+    COLD_DRINK_CHANNEL = first(COLD_DRINK_CHANNEL),
+    TRADE_CHANNEL = first(TRADE_CHANNEL),
+    SUB_TRADE_CHANNEL = first(SUB_TRADE_CHANNEL),
+    FIRST_DELIVERY_DATE = min(FIRST_DELIVERY_DATE),
+    FIRST_DELIVERY_YEAR = min(FIRST_DELIVERY_YEAR),
+    ON_BOARDING_DATE = min(ON_BOARDING_DATE),
+    ON_BOARDING_YEAR = min(ON_BOARDING_YEAR),
+    customer_age = as.numeric(format(Sys.Date(), "%Y")) - ON_BOARDING_YEAR,
+            
+    LOCAL_MARKET_PARTNER = LOCAL_MARKET_PARTNER[which.max(tabulate(match(LOCAL_MARKET_PARTNER,unique(LOCAL_MARKET_PARTNER))))],
+    CO2_CUSTOMER =  CO2_CUSTOMER[which.max(tabulate(match(CO2_CUSTOMER, unique(CO2_CUSTOMER))))],
+    
+    hasOrderedCases = as.integer(case_when((orderedCases)>0 ~1, TRUE ~ 0)),
+            
+    propCases = sum(orderedCases)/ sum(totalOrdered),
+    
+    zip_code =  first(ZIP), 
+            
+    city =  first(City),
+
+    state =  first(`State Name`), 
+
+    region = first(cluster),
+             
+    distance_from_centroid = first(distance_to_centroid),
+    orderedCases = sum(orderedCases),
+    orderedGallons = sum(orderedGallons),
+    totalOrdered = sum(totalOrdered)) 
+```
+
+
+```{r}
+orders_by_quarter <- UnaggregatedDates_Customer_No_Retailer %>%
+  filter(!is.na(PRIMARY_GROUP_NUMBER)) %>%
+  mutate(
+    quarter_clean = case_when(
+      Quarter_year.x == "1 2023" ~ "Q1 23",
+      Quarter_year.x == "2 2023" ~ "Q2 23",
+      Quarter_year.x == "3 2023" ~ "Q3 23",
+      Quarter_year.x == "4 2023" ~ "Q4 23",
+      Quarter_year.x == "1 2024" ~ "Q1 24",
+      Quarter_year.x == "2 2024" ~ "Q2 24",
+      Quarter_year.x == "3 2024" ~ "Q3 24",
+      Quarter_year.x == "4 2024" ~ "Q4 24"
+    )
+  ) %>%
+  group_by(quarter_clean) %>%
+  summarize(total_orders = sum(totalOrdered, na.rm = TRUE)) %>%
+  ungroup()
+
+orders_by_quarter$quarter_clean <- factor(
+  orders_by_quarter$quarter_clean,
+  levels = c("Q1 23", "Q2 23", "Q3 23", "Q4 23", "Q1 24", "Q2 24", "Q3 24", "Q4 24")
+)
+
+ggplot(orders_by_quarter, aes(x = quarter_clean, y = total_orders)) +
+  geom_col(fill = "darkblue") +
+  labs(title = "Total Orders by Quarter (Q1 2023 – Q4 2024)",
+       x = "Quarter",
+       y = "Total Orders") +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+# Imogen's Analysis Part 1:
+
+work with the yearly data to gain insights from the customers that have a retailer or do not
+
+
+## Retailer customers:
+
+- how are retail customers differnt from customers not a part of a retail?
+
+
+- what is the signficinace of retail customers in their ordering behaviors?
+
+
+- how is customer spread important in understanding retail customers?
+
+- what is the significance and impact on being a retail customer on your ordering amount?
+
+
+- what are important predictors of a retailers overall ordering behavior
+
+
+- what features add clarity to a model when trying to predict a retailers orders
+
+### Phase 1: Goal: Show that being part of a PRIMARY_GROUP_NUMBER is statistically significant for ordering behavior using a C5 decision tree (classification).
+
+I know we already established this but just to have it in my code to start the analysis off:
+
+establishing the effect of a customer being a part of a retailer:
+
+```{r}
+
+# the "main" data that was used previously : all customer data profile joined with transaction using the Customer Profile Location Data created above.
+
+Customer_Full_Data <- CustomerProfile_Location %>% 
+  left_join(aggregated_cost_wide, by = "CUSTOMER_NUMBER") %>% 
+  mutate(across(c(orderedCases_2023, orderedCases_2024, orderedGallons_2023, orderedGallons_2024), ~ replace_na(.x, 0)),
+         total_ordered = (orderedCases_2024 + orderedGallons_2024 +orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2023 = (orderedCases_2023 + orderedGallons_2023),
+         total_ordered_2024 = (orderedCases_2024 + orderedGallons_2024)) %>% 
+  filter(!(year(FIRST_DELIVERY_DATE) == 2023 & orderedCases_2023 == 0 & orderedGallons_2023 == 0) &
+    !(year(FIRST_DELIVERY_DATE) == 2024 & orderedCases_2024 == 0 & orderedGallons_2024 == 0)) %>% 
+  filter(!(total_ordered_2023 ==0 & total_ordered_2024 == 0))
+
+Customer_Full_Data <- Customer_Full_Data %>%
+  mutate(has_outlet = if_else(!is.na(PRIMARY_GROUP_NUMBER), 1, 0))
+
+outlet_counts <- Customer_Full_Data %>%
+  group_by(Entity_ID) %>%
+  summarise(number_of_outlets = n_distinct(CUSTOMER_NUMBER), .groups = "drop")
+
+Customer_Full_Data <- Customer_Full_Data %>%
+  left_join(outlet_counts, by = "Entity_ID")
+
+
+# this should not have any issues running on the group set as it is using the same defined variables from above. 
+
+Customer_Full_Data <- Customer_Full_Data |>
+  mutate(
+    total_ordered = orderedCases_2023 + orderedGallons_2023 + orderedCases_2024 + orderedGallons_2024,
+    high_order_volume = if_else(total_ordered >= 400, "High", "Low")
+  )
+
+set.seed(123)
+train_index <- sample(1:nrow(Customer_Full_Data), 0.7 * nrow(Customer_Full_Data))
+train_data <- Customer_Full_Data[train_index, ]
+test_data <- Customer_Full_Data[-train_index, ]
+predictors <- c("has_outlet", "number_of_outlets", "CO2_CUSTOMER", "LOCAL_MARKET_PARTNER")
+target <- "high_order_volume"
+test_x <- test_data[, predictors]
+test_y <- as.factor(test_data[[target]])
+
+tree_model <- C5.0(
+  x = train_data[, predictors],
+  y = as.factor(train_data[[target]])
+)
+
+summary(tree_model)
+
+pred <- predict(tree_model, newdata = test_x)
+
+confusionMatrix(pred, as.factor(test_y))
+
+C5imp(tree_model, metric = "usage")
+
+
+
+
+```
+Local market partner, then has outlet, then the number of outlets
+
+Swire is already asking us to better understand the LMP group which I did explore below. 
+
+
+>> Using a decision tree, we found that customers who belong to a retailer group (as indicated by has_outlet) are significantly more likely to be high-volume purchasers. The number of outlets in a retailer group also contributes, although to a lesser degree.
+
+>> the decsion tree also confirms the LMP groups to be high ordering individuals 
+
+
+
+decision tree shows that being part of a retail group (has_outlet) significantly impacts ordering behavior
+
+Look at how order volume varies by:
+number_of_outlets
+GeoSpread (if you have it)
+FIRST_DELIVERY_YEAR (tenure)
+Region, ZIP, LOCAL_MARKET_PARTNER, etc
+
+
+
+investigating the retailer customers more in depth:
+
+- review my previous modeling code, where i struggled to find any importance in features for non outlet customers without including their ordering behaviors 
+
+
+### Phase 2: Data Driven Strategies: Retail Customers
+Use logistic regression or a C5.0 decision tree to identify predictors of over_threshold using:
+
+number_of_outlets
+
+GeoSpread
+
+has_CO2
+
+LOCAL_MARKET_PARTNER
+
+customer_age
+
+ZIP-level clustering, etc.
+
+bucket grouping impact
+
+We want to be able to give data driven insights into the retail customers 
+
+                        
+```{r Retail customers 1}
+
+# what distinguishes the threshold bucket segment groups from each other?
+
+Customer_Full_Data |>
+  group_by(has_outlet) |>
+  summarise(n_distinct_customers = n_distinct(CUSTOMER_NUMBER))
+
+12097/(12097 + 18047)
+
+segment_summary <- Annual_Customer_Retailer |>
+  group_by(Binning_column) |>
+  summarise(
+    n_customers = n(),
+    avg_order_2023 = mean(total_ordered_2023, na.rm = TRUE),
+    avg_order_2024 = mean(total_ordered_2024, na.rm = TRUE),
+    avg_percent_growth = mean(percentChangeYOY, na.rm = TRUE),
+    avg_outlets = mean(numberOfOutlets, na.rm = TRUE),
+    avg_geo_spread = mean(GeoSpread, na.rm = TRUE),
+    avg_customer_age = mean(customer_age, na.rm = TRUE),
+    pct_CO2 = mean(CO2_CUSTOMER, na.rm = TRUE),
+    pct_LMP = mean(LOCAL_MARKET_PARTNER, na.rm = TRUE)
+  )|>
+  mutate(percent_of_total = round(n_customers / sum(n_customers) * 100, 1))
+
+segment_summary |>
+  arrange(desc(n_customers)) |>
+  kable(format = "html", digits = 4, caption = "Customer Segment Summary") |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+
+
+lm_model <- lm(total_ordered_2024 ~ total_ordered_2023 + numberOfOutlets + wellPerformingOutlet +GeoSpread + FREQUENT_ORDER_TYPE + CO2_CUSTOMER + LOCAL_MARKET_PARTNER + customer_age, data = Annual_Customer_Retailer )
+
+summary(lm_model)
+
+
+```
+
+>> Retail Customers make up 40 percent of the customers. 
+
+>> linear model simple: order amount in the prior year was important, nothing else is signficant at least for a linear prediction of order volume in 2024. We see an increase in 2024 ordering based on 2023 orders
+
+>> what if we break out the new customers on thier own, this gives us a chance to look at the YOY growth as a column as well:
+
+### Subsets of Retail Customers 
+
+#### Growth Subset (Transitionary)
+
+>> running a linear model on specific segments: 
+
+```{r Retail Customers 2}
+# using the main data we created, segment out the growth or those flagging customers that are moving. 
+
+growth_subset <- Annual_Customer_Retailer |>
+  filter(Binning_column %in% c("low volume high growth", "transitionary growing", "transitionary declining"))
+
+set.seed(100)
+train_index <- sample(1:nrow(growth_subset), 0.7 * nrow(growth_subset))
+growth_train <- growth_subset[train_index, ]
+growth_test <- growth_subset[-train_index, ]
+growth_test_x <- growth_test[, !names(growth_test) %in% c("total_ordered_2024")]
+growth_test_y <- growth_test[["total_ordered_2024"]]
+
+# linear model to predict orders for 2024
+growth_model <- lm(total_ordered_2024 ~ total_ordered_2023 + numberOfOutlets + propCases +
+                     wellPerformingOutlet + GeoSpread + CO2_CUSTOMER +
+                     LOCAL_MARKET_PARTNER + customer_age,
+                   data = growth_train)
+
+summary(growth_model)
+
+# test on the test data
+preds <- predict(growth_model, newdata = growth_test_x)
+actuals <- growth_test_y
+
+rmse_val <- rmse(actuals, preds)
+r2_val <- 1 - sum((actuals - preds)^2) / sum((actuals - mean(actuals))^2)
+
+rmse_val
+r2_val
+
+
+
+```
+Now once we have segmented for the growth customers, we can see increased signficance on an additional feature - well performing outlets, where, well performing outlet is the number of outles of a retailer that are meeting 400 in 23 or 204
+
+higher number of well perfoming outlet predicts higher growth, Growth or strength in even a few outlets has measurable impact at the retailer level
+
+What is also interesting here is that for this subset of customers we see a (slightly signficant) negative intercept on 2023, meaning that higher orders in 2023 predict lower orders in 2024 
+
+We are still seeing a large amount of noise or non linear relationships, lets use a tree model to see if we can capture relevant relationships or if we can confirm that some of the features are not relevant in understanding this segment of customers 
+
+```{r}
+
+growth_tree <- rpart(
+  total_ordered_2024 ~ total_ordered_2023 + numberOfOutlets +
+    wellPerformingOutlet + GeoSpread + CO2_CUSTOMER +
+    LOCAL_MARKET_PARTNER + customer_age,
+  data = growth_subset,
+  method = "anova",
+  control = rpart.control(cp = 0.001)  # can lower cp to grow deeper trees
+)
+
+rpart.plot(growth_tree, type = 2, extra = 101, fallen.leaves = TRUE)
+
+
+```
+
+Here we confirm, the order value for a 2023 year is most important, but now we are seeing that for those who ordered a low amount in 2023 there is a significance in having either greater or less than 2 outlets 
+
+I decreased the cp to create a deeper tree, started with .01 then did .001 and now i see that for those customers who are above 128 in 2023 but below 240 gallons year becomes a important split, Younger customers are growing faster, — new accounts gaining traction??
+
+
+also important to see that customers who order belowe 128 in 2023 are on a low growth path and cusomters who order above are higher growth 
+this is like a new threshold kind of, like of the growth/transitionary customers 128 gallon order amounts in a year is a new threhsold. 
+
+
+
+I want to run a RF model now just as like a sanity check on the features that are important,
+
+```{r}
+set.seed(100)
+
+rf_growth <- randomForest(
+  total_ordered_2024 ~ total_ordered_2023 + numberOfOutlets + 
+    wellPerformingOutlet + GeoSpread + CO2_CUSTOMER + 
+    LOCAL_MARKET_PARTNER + customer_age,
+  data = growth_subset,
+  importance = TRUE,
+  ntree = 500
+)
+
+print(rf_growth)
+importance(rf_growth)
+varImpPlot(rf_growth, type = 1)  # Type 1 = Mean Decrease in Accuracy
+
+
+```
+
+
+So what is the overall strategy here: for retail customers who order X amount do X for those who order x amount and are older younger have number of outlets they look to be the growing customers, 
+
+on average how much does this subset of customers grow?
+
+#### Mighty Minis? 
+
+These are retailers, with only a few customers but have high order values 
+
+```{r}
+
+mighty_minis <- Annual_Customer_Retailer |>
+  filter(numberOfOutlets <= 3, total_ordered_2024 >= 400) |>
+  mutate(segment = "Mighty Minis")
+
+low_performers <- Annual_Customer_Retailer |>
+  filter(numberOfOutlets <= 3, total_ordered_2024 < 400) |>
+  mutate(segment = "Low Performers")
+
+combined <- bind_rows(mighty_minis, low_performers)
+
+comparison_summary <- combined|>
+  group_by(segment) |>
+  summarise(
+    n_customers = n(),
+    avg_order_2023 = round(mean(total_ordered_2023, na.rm = TRUE), 1),
+    avg_order_2024 = round(mean(total_ordered_2024, na.rm = TRUE), 1),
+    avg_geo_spread = round(mean(GeoSpread, na.rm = TRUE), 2),
+    avg_outlets = round(mean(numberOfOutlets, na.rm = TRUE), 2),
+    avg_well_performing = round(mean(wellPerformingOutlet, na.rm = TRUE), 2),
+    avg_customer_age = round(mean(customer_age, na.rm = TRUE), 1),
+    pct_LMP = round(mean(LOCAL_MARKET_PARTNER, na.rm = TRUE) * 100, 1),
+    pct_CO2 = round(mean(CO2_CUSTOMER, na.rm = TRUE) * 100, 1)
+  )
+
+comparison_summary %>%
+  kable(format = "html", caption = "Comparison of Mighty Minis vs Low-Performing Small Retailers") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+quickly remind myself some of the business questions to keep my work focused:
+What factors or characteristics distinguish high-volume accounts? 
+How can we predict small accounts with growth potential?
+How can these insights inform routing and sales strategy?
+
+
+
+```{r}
+t.test(total_ordered_2023 ~ segment, data = combined)
+t.test(customer_age ~ segment, data = combined)
+t.test(GeoSpread ~ segment, data = combined)
+t.test(wellPerformingOutlet ~ segment, data = combined)
+
+
+# LMP status
+
+lmp_table <- table(combined$segment, combined$LOCAL_MARKET_PARTNER)
+x_lmp <- lmp_table[, "1"]  # Or try lmp_table[, 2] if that throws an error
+n_lmp <- rowSums(lmp_table)
+
+prop.test(x = x_lmp, n = n_lmp)
+
+# CO2 customer status
+co2_table <- table(combined$segment, combined$CO2_CUSTOMER)
+x_co2 <- co2_table[, "1"] 
+n_co2 <- rowSums(co2_table)
+
+prop.test(x = x_co2, n = n_co2)
+```
+
+
+so instead of trying to just predict order volume across the board what if i just kept segmenting and comparing across groups? 
+
+the two segments i am exploring are the "good" retailers with 3 or less outlets, and comparing them with their poorer performing peers in terms of outlet count. 
+
+so for the same range of outlets
+mighty minis are: 
+Higher 2023 orders
+More well-performing outlets (even within a group of 3!)
+Wider GeoSpread
+Slightly older tenure
+
+Mighty minis have early success, good internal performance, and broader footprints.
+
+statistical testing clearly supports that Mighty Minis are stronger customers across nearly all dimensions:
+Order more
+Have more mature customer age
+Wider reach
+Better-performing outlets
+More likely to be CO2 customers
+
+But interestingly:
+
+LMP status is slightly higher among Low Performers, which could be worth exploring.
+
+
+but can we find insight into the best number of outlets for a retailer to have? 
+Is there an optimal number of outlets — or a tipping point where performance improves or declines?
+That would help Swire:
+Prioritize expansion of growing groups
+Identify risk in “too big but underperforming” chains
+lets further segment the retailer groups by the outlet counts:
+```{r}
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(outlet_bin = case_when(
+    numberOfOutlets == 1 ~ "1",
+    numberOfOutlets == 2 ~ "2",
+    numberOfOutlets == 3 ~ "3",
+    numberOfOutlets >= 4 & numberOfOutlets <= 6 ~ "4-6",
+    numberOfOutlets > 6 ~ "7+"
+  ))
+
+outlet_perf_summary <- Annual_Customer_Retailer |>
+  group_by(outlet_bin) |>
+  summarise(
+    n = n(),
+    avg_total_order_2023 = mean(total_ordered_2023, na.rm = TRUE),
+    avg_total_order_2024 = mean(total_ordered_2024, na.rm = TRUE),
+    pct_above_threshold23 = mean(total_ordered_2023 >= 400),
+    pct_above_threshold24 = mean(total_ordered_2024 >= 400),
+    avg_wellPerformingOutlet = mean(wellPerformingOutlet, na.rm = TRUE),
+    avg_customer_age = mean(customer_age, na.rm = TRUE),
+    avg_GeoSpread = mean(GeoSpread, na.rm = TRUE)
+  ) %>%
+  arrange(desc(pct_above_threshold24))
+
+outlet_perf_summary |>
+  kable(digits = 2, caption = "Performance by Outlet Count Segment") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+>>  here are still kind of hidden relative to the threshold of 400, like we are still seeing far higher profrming averages for order totals for retiailers with any number of outlets, but we can use the threshold column and see that of retail customers there are 235 custoemrs with primary group ID that have only one outlet, of those 48% are reaching threshold in any given year, but they are still 2,424 units, meaning the few that perform — perform big. is this like a low risk low reward or high risk high reward kind of thing that should be explored in a segmentation? 
+
+
+2–3 outlet groups are growth sweet spot? 
+2s and 3s are below the big guys, but they're doing 3–4x the threshold, on average.
+
+And wellPerformingOutlet jumps fast from 0.5 (1-outlet) to 1.7 (3-outlet).
+
+These groups are small enough to be agile, but big enough to show scale effects. They might be your best candidates for investment, sales focus, and expansion.
+
+
+Going from 4–6 to 7+ doubles order volume, but also comes with:
+
+Higher GeoSpread (logistics complexity)
+
+Higher age (possibly stable but saturated)
+
+the mega-retailers are high volume, but not where the “next Swire star” is coming from. - these are like the bin for high order amount 
+
+
+ Found that number of outlets ≠ destiny — even small groups can crush volume if other conditions are right 
+ 
+ >> this^^ like i feel like i keep asking myself what did i learn bc i am not seeing what i expect to see like i am too expectant on a linear result 
+ 
+ 
+ 
+ 
+ 
+ 
+#### "punching"?
+Moving to looking at those hidden gems: smaller retail groups generating outsized volume, and they’re exactly the kind of accounts Swire wants to identify early and nurture.
+
+We want to capture customers who:
+Have few outlets ( 3 or less)
+Have high total order volume relative to size
+
+
+```{r}
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(volume_per_outlet24 = total_ordered_2024 / numberOfOutlets)
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(volume_per_outlet23 = total_ordered_2023 / numberOfOutlets)
+
+
+small_retailers <- Annual_Customer_Retailer |>
+  filter(numberOfOutlets <= 3)
+
+threshold <- quantile(small_retailers$volume_per_outlet24, 0.75, na.rm = TRUE)
+
+punching_above_weight <- small_retailers |>
+  filter(volume_per_outlet24 >= threshold)
+
+
+comparison <- small_retailers %>%
+  mutate(segment = if_else(volume_per_outlet24 >= threshold, "Punching", "Not Punching")) |>
+  group_by(segment) %>%
+  summarise(
+    n = n(),
+    avg_order_2023 = mean(total_ordered_2023),
+    avg_order_2024 = mean(total_ordered_2024),
+    avg_outlets = mean(numberOfOutlets),
+    avg_customer_age = mean(customer_age),
+    avg_GeoSpread = mean(GeoSpread),
+    avg_wellPerformingOutlet = mean(wellPerformingOutlet),
+    pct_above_400 = mean(total_ordered_2024 >= 400)
+  )
+
+small_retailers <- small_retailers |>
+  mutate(segment = if_else(volume_per_outlet24 >= threshold, "Punching", "Not Punching")) 
+
+small_retailers <- small_retailers |>
+  mutate(punching_flag = if_else(segment == "Punching", 1, 0))
+
+set.seed(100) 
+train_indices <- sample(1:nrow(small_retailers), 0.7 * nrow(small_retailers))
+train_data <- small_retailers[train_indices, ]
+test_data <- small_retailers[-train_indices, ]
+test_x <- test_data |>
+  select(total_ordered_2023, numberOfOutlets, wellPerformingOutlet,
+         customer_age, GeoSpread, CO2_CUSTOMER, LOCAL_MARKET_PARTNER)
+test_target <- test_data$punching_flag
+
+
+punch_model <- glm(
+  punching_flag ~ total_ordered_2023 + numberOfOutlets + wellPerformingOutlet +
+    customer_age + GeoSpread + CO2_CUSTOMER + LOCAL_MARKET_PARTNER,
+  data = train_data,
+  family = binomial
+)
+
+
+test_data$predicted_probs <- predict(punch_model, newdata = test_x, type = "response")
+
+
+test_data$predicted_class <- ifelse(test_data$predicted_probs >= 0.5, 1, 0)
+
+
+
+table(Predicted = test_data$predicted_class, Actual = test_target)
+
+
+mean(test_data$predicted_class == test_data$punching_flag)
+
+summary(punch_model)
+
+```
+well performing outlet percentage is an indicator of growth 
+
+
+
+
+logistic model, which was made to find the punching vs non punching retail customers:
+number of outlet and well perfomring outlet are signfincat indicators of a smaller retailer perofming better, where we see punching as retailers with 3 or less outlets, who were at the top 25% of small retailers by volume per outlet. 
+
+total_ordered_2023	+0.00144	< 0.000001	
+The higher the 2023 order volume, the more likely the customer is to be Punching in 2024.
+
+numberOfOutlets	−2.64	0.00019	
+Fewer outlets = more likely to punch. This confirms you’re finding small but mighty.
+
+wellPerformingOutlet	+1.81	0.003
+Each additional well-performing outlet dramatically increases the odds of being a Puncher.
+
+so this can help us tell swire, that prior years ordering performance is signification on thier next years, and we can also say the number of outlets is not as signficnat as the proportion of well perofmring outlets, there are small retailers that are performing well with volume per outlet 
+
+>> the only thing i will say here is maybe i want to change this to look at "punhcing" as a certain threhsold of glalons rather than top 25 % of small retialers, i want to kind of make the comparision aaccross all retialers, how should we do that? 
+
+>> really the question is we should explore the punhcing customers across all the data but we will capture that with the segmentation work we do with the bins we already defined
+
+the work here was mostly to explore how the number of outlets is not super important to the performance of retailcustomers but rather that the proportion of those well performing outlets is important, and even within smaller retailers who have 3 or less outlets they can be high performers, and within the small retialers, there are traits that are signfincat, where well performing outlets improve thier performance and number of outlets does not necessarily improve. this kind of captures those ones who have 1 or 2 outlets but order a lot, and within this group not other features were important, so there is no disntiuighment between these small retailers besiseds 23 order, number of outlets and well peromfring outlet 
+
+>> maybe i should explore volume per outlet further, i can do that across the segments we already defined 
+
+
+Growth Subset	High Risk / High Reward and Emerging Opportunity	Customers gaining traction — you’ve modeled their potential and seen which features matter.
+
+
+Mighty Minis	Reliable Performers (subset)	Strong small retailers consistently exceeding 400 — proven, stable.
+
+Punching Customers	Across multiple bins	Originally small retailers, but your new volume-per-outlet threshold may flag some in other segments too. Could be both Reliable or Emerging.
+
+
+
+#### Risk/Reward segmentation:
+use the binning strategy, to define the strategic customer roles? or like the customer segments
+
+    
+```{r}
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(
+    risk_reward_segment = case_when(
+      Binning_column %in% c("high volume high growth", "high volume low growth") ~ "Reliable Performers",
+      Binning_column == "low volume low growth" ~ "Low Risk / Low Reward",
+      Binning_column == "low volume high growth" ~ "High Risk / High Reward",
+      Binning_column == "transtionary growing " ~ "Emerging Opportunity",  # had issues here, realized thers a space on the bin name
+      Binning_column == "transitionary declining" ~ "Intervention Needed",
+      TRUE ~ "Unclassified"
+    )
+  )
+
+# we got one unclassified person who had 400 in 23 and like 200 in 24 and was transitionary declining so i think the bins need to be less than or ewual
+
+
+
+
+```
+    
+
+# Continued Modeling - March 
+
+looking into presentation points for SWIRE presentation
+
+
+## Retail performance is stat sig diff from non retail:
+
+Show that retail customers (those with a PRIMARY_GROUP_NUMBER) are statistically different from non-retail customers in terms of ordering behavior.
+
+This supports a strategic case for the need to analyze and route retail and non-retail accounts differently. 
+
+```{r}
+
+t.test(total_ordered_2024 ~ has_outlet, data = Customer_Full_Data)
+t.test(total_ordered_2023 ~ has_outlet, data = Customer_Full_Data)
+
+
+ggplot(Customer_Full_Data, aes(x = factor(has_outlet), y = total_ordered_2024)) +
+  geom_boxplot(fill = "#2A9D8F") +
+  labs(title = "Total Ordered in 2024: Retail vs Non-Retail",
+       x = "Retail Customer (1 = Yes, 0 = No)",
+       y = "Total Ordered 2024")
+
+```
+
+difference is statistically significant 
+
+### PRESENTATION point? 
+
+T Test Results indicate that the groups retailer vs customers not in retail groups are statistically different when it comes to ordering behavior. Retail groups order about 4 times more than non retail groups, SWIRE also indicated that they viewed retail groups as one, and would not move distribution from red truck for one customer in a retail group, but rather move a whole retail group. 
+
+Retail customers (with a primary group) order 3–4x more volume on average compared to non-retail customers in both 2023 and 2024. The differences are highly statistically significant, with p-values far below 0.001.
+
+
+This was the initial base of our analysis, in order to get better understanding and interpretations for SWIRE we continued our analysis on the retail and non retail groups separately: 
+- Separate modeling/forecasting for retail vs non-retail
+- More sophisticated segmentation within the retail group and non retail groups. 
+
+
+Swire should likley maintain or create distinct routing/growth strategies for retail customers as they: have higher baseline volume and greater potential for outlet-level expansion. 
+
+```{r}
+
+# just some data reformatting to plot order differences between retail and non retail customers
+ 
+volume_long <- Customer_Full_Data |>
+  mutate(is_retail = if_else(has_outlet == 1, "Retail", "Non-Retail")) |>
+  select(is_retail, total_ordered_2023, total_ordered_2024) |>
+  pivot_longer(cols = starts_with("total_ordered"),
+               names_to = "Year",
+               values_to = "Total_Ordered") |>
+  mutate(Year = recode(Year,
+                       "total_ordered_2023" = "2023",
+                       "total_ordered_2024" = "2024"))
+
+medians <- volume_long |>
+  group_by(is_retail, Year) |>
+  summarise(median_val = median(Total_Ordered, na.rm = TRUE), .groups = "drop")
+
+
+ggplot(volume_long, aes(x = Year, y = Total_Ordered, fill = is_retail)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, position = position_dodge(width = 0.8)) +
+  scale_y_continuous(limits = c(0, quantile(volume_long$Total_Ordered, 0.95, na.rm = TRUE))) +
+  geom_text(data = medians, aes(label = paste0("Median: ", round(median_val, 0)),
+                                y = median_val + 100, group = is_retail),
+            position = position_dodge(width = 0.8),
+            size = 3.5, vjust = 0, fontface = "bold", color = "black") +
+  labs(title = "Total Ordered Volume: Retail vs Non-Retail (2023 vs 2024)",
+       subtitle = "Retail customers order ~3x more volume on average",
+       x = "Year",
+       y = "Total Ordered Volume",
+       fill = "Customer Type") +
+  theme_minimal(base_size = 13)
+
+
+
+```
+
+```{r}
+
+volume_long <- Customer_Full_Data |>
+  mutate(is_retail = if_else(has_outlet == 1, "Retail", "Non-Retail")) |>
+  select(is_retail, total_ordered_2023, total_ordered_2024) |>
+  pivot_longer(cols = starts_with("total_ordered"),
+               names_to = "Year",
+               values_to = "Total_Ordered") |>
+  mutate(Year = recode(Year,
+                       "total_ordered_2023" = "2023",
+                       "total_ordered_2024" = "2024"))
+means <- volume_long |>
+  group_by(is_retail, Year) |>
+  summarise(mean_val = mean(Total_Ordered, na.rm = TRUE), .groups = "drop")
+
+ggplot(volume_long, aes(x = Year, y = Total_Ordered, fill = is_retail)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, position = position_dodge(width = 0.8)) +
+  scale_y_log10() +
+  geom_point(data = means, aes(x = Year, y = mean_val, group = is_retail),
+             position = position_dodge(width = 0.8), shape = 18, size = 3, color = "black") +
+  geom_text(data = means, aes(label = paste0("Mean: ", round(mean_val, 0)),
+                              y = mean_val, group = is_retail),
+            position = position_dodge(width = 0.8),
+            vjust = -1.2, size = 3.5, fontface = "bold", color = "black") +
+  scale_fill_manual(values = c("Retail" = "red", "Non-Retail" = "white")) +
+  labs(
+    title = "Total Ordered Volume: Retail vs Non-Retail (2023 vs 2024)",
+    subtitle = "Means shown (log scale): Retail customers order ~3.5x more on average",
+    x = "Year",
+    y = "Total Ordered Volume (log scale)",
+    fill = "Customer Type"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+^ possible visuals for the slide - i dont love them bc they seem kinda junky and a lot visually, so maybe we do a simpler bar plot or something that looks simpler? 
+
+
+
+## Past outlet-level performance predicts future volume
+
+- prove that we can use prior order for future order? 
+
+Can we quantify the buckets, like this group of emerging customers, is ordering at ____ and will be ordering at ____ in 2025 if all goes well 
+
+Having at least one well-performing outlet in 2023 is associated with a significantly higher likelihood of crossing the 400-gallon threshold in 2024
+
+```{r}
+
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(is_above_400_2024 = if_else(total_ordered_2024 >= 400, 1, 0))
+
+
+logit_model <- glm(
+  is_above_400_2024 ~ wellPerformingOutlet + total_ordered_2023 +
+    numberOfOutlets + customer_age + GeoSpread + CO2_CUSTOMER + LOCAL_MARKET_PARTNER,
+  data = Annual_Customer_Retailer,
+  family = binomial
+)
+
+summary(logit_model)
+
+exp(coef(logit_model))
+
+exp(3.1900584)
+```
+
+wellPerformingOutlet is highly statistically significant 
+
+Estimate = 3.19  meaning, Each additional well-performing outlet multiplies the odds of exceeding 400 gallons by ~24x.
+
+Customers with even one well-performing outlet are 24x more likely to exceed 400 gallons in the following year.
+Outlet-level performance is the strongest growth predictor, even when controlling for total volume, outlet count, and CO2 status.
+
+
+i want to verify this performance using a train test split 
+```{r}
+
+set.seed(123)
+split_index <- sample(1:nrow(Annual_Customer_Retailer), 0.7 * nrow(Annual_Customer_Retailer))
+train_data <- Annual_Customer_Retailer[split_index, ]
+test_data  <- Annual_Customer_Retailer[-split_index, ]
+target <- "is_above_400_2024"
+test_x <- test_data %>% select(-all_of(target))
+test_y <- test_data[[target]]
+
+
+
+glm_1 <- glm(
+  is_above_400_2024 ~ wellPerformingOutlet + total_ordered_2023 +
+    numberOfOutlets + customer_age + GeoSpread + CO2_CUSTOMER + LOCAL_MARKET_PARTNER,
+  data = train_data,
+  family = "binomial"
+)
+
+predicted_probs <- predict(glm_1, newdata = test_x, type = "response")
+
+predicted_class <- ifelse(predicted_probs >= 0.5, 1, 0)
+
+# Confusion Matrix
+table(Predicted = predicted_class, Actual = test_y)
+
+# Accuracy
+mean(predicted_class == test_y)
+
+summary(glm_1)
+
+# had to use explicit arguments, bc i kept getting an error. 
+roc_obj <- pROC::roc(response = test_y, predictor = predicted_probs)
+pROC::auc(roc_obj)
+
+
+```
+With an AUC of 0.97, we can be highly confident in its ability to distinguish growth-ready customers from those unlikely to expand. well performing outlet was the biggest signal of future growth
+
+this also helps us like further prove that retail customers should be seperate bc outlet information is not something available across all customers.
+
+now we can use this to develop a kind of scoring for the customer - 
+
+## cross validation updates
+
+```{r}
+
+# factor target
+
+Annual_Customer_Retailer$growth_2024 <- ifelse(Annual_Customer_Retailer$is_above_400_2024 == 1, "above", "below")
+Annual_Customer_Retailer$growth_2024 <- as.factor(Annual_Customer_Retailer$growth_2024)
+
+# cross-validation
+set.seed(123)
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# logistic regression CV
+cv_model <- train(
+  growth_2024 ~ wellPerformingOutlet + total_ordered_2023 +
+    numberOfOutlets + customer_age + GeoSpread + CO2_CUSTOMER + LOCAL_MARKET_PARTNER,
+  data = Annual_Customer_Retailer,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+
+roc_obj <- pROC::roc(response = test_y, predictor = predicted_probs)
+pROC::auc(roc_obj)
+
+# best threshold finding for increased sensitivity balanced with specificity  
+thresholds <- data.frame(
+  threshold = roc_obj$thresholds,
+  sensitivity = roc_obj$sensitivities,
+  specificity = roc_obj$specificities
+)
+
+# Find the threshold with maximum sensitivity
+best_sens <- thresholds[which.max(thresholds$sensitivity), ]
+print(best_sens)
+
+
+best_balanced <- thresholds |>
+  filter(sensitivity >= 0.95, specificity >= 0.80) |>
+  slice_max(order_by = specificity, n = 1)
+
+print(best_balanced)
+
+
+# new optimal threshhold for the model: 0. 4583473
+
+
+# Use the optimal threshold from ROC analysis
+optimal_threshold <- 0.4583473
+predicted_class_opt <- ifelse(predicted_probs >= optimal_threshold, 1, 0)
+
+# Confusion matrix and accuracy at new threshold
+conf_matrix_opt <- table(Predicted = predicted_class_opt, Actual = test_y)
+accuracy_opt <- mean(predicted_class_opt == test_y)
+
+# Print results
+print(conf_matrix_opt)
+cat("New Accuracy:", accuracy_opt, "\n")
+
+
+
+# new CV at the threshold 
+
+set.seed(123)
+
+# Create 5 folds
+folds <- createFolds(Annual_Customer_Retailer$is_above_400_2024, k = 5)
+
+# Set custom threshold
+custom_thresh <- 0.4583473
+
+cv_results <- data.frame(ROC = numeric(), Sens = numeric(), Spec = numeric())
+
+for (i in 1:5) {
+  # Split data
+  test_idx <- folds[[i]]
+  train_fold <- Annual_Customer_Retailer[-test_idx, ]
+  test_fold  <- Annual_Customer_Retailer[test_idx, ]
+  
+  # Train logistic model
+  glm_cv <- glm(
+    is_above_400_2024 ~ wellPerformingOutlet + total_ordered_2023 +
+      numberOfOutlets + customer_age + GeoSpread + CO2_CUSTOMER + LOCAL_MARKET_PARTNER,
+    data = train_fold,
+    family = "binomial"
+  )
+  
+  # Predict probabilities
+  probs <- predict(glm_cv, newdata = test_fold, type = "response")
+  
+  # Classify using your custom threshold
+  preds <- ifelse(probs >= custom_thresh, 1, 0)
+  
+  # Evaluate
+  roc <- pROC::roc(test_fold$is_above_400_2024, probs)
+  sens <- sensitivity(as.factor(preds), as.factor(test_fold$is_above_400_2024), positive = "1")
+  spec <- specificity(as.factor(preds), as.factor(test_fold$is_above_400_2024), negative = "0")
+  
+  # Store results
+  cv_results <- rbind(cv_results, data.frame(
+    ROC = pROC::auc(roc),
+    Sens = sens,
+    Spec = spec
+  ))
+}
+
+# View results
+summary(cv_results)
+colMeans(cv_results)
+
+```
+
+
+ROC AUC = 0.97 —  model is  strong at distinguishing between customers who will and won’t cross the 400-gallon threshold.
+
+Sensitivity 96.5% also good at identifying true growers (those who do cross the threshold).
+
+
+To validate the strength of our retail customer growth model, we performed 5-fold cross-validation using a custom threshold optimized for high sensitivity. The model consistently achieved an AUC of ~0.97 and identified nearly 97% of growth-ready customers while maintaining high specificity. This gives us confidence in our ability to proactively identify and prioritize future high-performing accounts. -> i dont think we really need to say anyhting like this in the presentation (i think thats getting too into the coding weeds)
+
+
+```{r}
+
+glm_final <- glm(
+  is_above_400_2024 ~ wellPerformingOutlet + total_ordered_2023 +
+    numberOfOutlets + customer_age + GeoSpread + CO2_CUSTOMER + LOCAL_MARKET_PARTNER,
+  data = Annual_Customer_Retailer,
+  family = "binomial"
+)
+
+# predict a 2025 over under 400 using the new threhsold.
+Annual_Customer_Retailer <- Annual_Customer_Retailer %>%
+  mutate(
+    growth_score_2025 = predict(glm_final, type = "response"),
+    predicted_over_400_2025 = if_else(growth_score_2025 >= 0.458, 1, 0)  # Using best threshold
+  )
+
+```
+
+
+```{r}
+summary_table <- Annual_Customer_Retailer |>
+  group_by(Binning_column) |>
+  summarise(
+    n_customers = n(),
+    above_400_2024 = sum(is_above_400_2024 == 1, na.rm = TRUE),
+    predicted_above_400_2025 = sum(predicted_over_400_2025 == 1, na.rm = TRUE),
+    pct_above_400_2024 = round(mean(is_above_400_2024 == 1, na.rm = TRUE) * 100, 1),
+    pct_predicted_above_400_2025 = round(mean(predicted_over_400_2025 == 1, na.rm = TRUE) * 100, 1)
+  ) %>%
+  arrange(desc(pct_predicted_above_400_2025))
+
+print(summary_table)
+```
+
+
+### removing over 1000 in both years to improve predictions 
+
+```{r}
+
+# start with moving over 1000
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(Binning_column = case_when(
+    (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY < 0.10 ~ "low volume low growth",
+    (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY > 0.10 ~ "low volume high growth",
+    (total_ordered_2023 >= 1000 & total_ordered_2024 >= 1000 ) & percentChangeYOY < 0.05  ~ "high volume low growth",
+    (total_ordered_2023 >= 1000 & total_ordered_2024 >= 1000 ) & percentChangeYOY > 0.05  ~ "high volume high growth",
+    (total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY > 0 ~ "transtionary growing",
+    (total_ordered_2023 >= 400 | total_ordered_2024 >= 400) & percentChangeYOY < 0 ~ "transitionary declining" ))
+    
+  
+Annual_Customer_Retailer <- Annual_Customer_Retailer |>
+  mutate(
+    risk_reward_segment = case_when(
+      Binning_column %in% c("high volume low growth" , "high volume high growth") ~ "Reliable Performers",
+      Binning_column == "low volume low growth" ~ "Low Risk / Low Reward",
+      Binning_column == "low volume high growth" ~ "High Risk / High Reward",
+      Binning_column == "transtionary growing" ~ "Emerging Opportunity",  # had issues here, realized thers a space on the bin name
+      Binning_column == "transitionary declining" ~ "Intervention Needed",
+      TRUE ~ "Unclassified"
+    )
+  )
+
+# now i want to filter out the reliable guys, for those with 1000 in both years 
+
+non_reliable <- Annual_Customer_Retailer |>
+  filter(!(Binning_column %in% c("high volume low growth", "high volume high growth")))
+
+non_reliable <- non_reliable |>
+  mutate(is_above_400_2024 = ifelse(total_ordered_2024 >= 400, 1, 0))
+
+non_reliable <- non_reliable |>
+  select(-starts_with("growth_score_2025"),
+         -starts_with("predicted_over_400_2025"))
+
+# no we will retrain to find 2024 from 2023 to see how good the model is 
+set.seed(2024)
+train_idx <- sample(1:nrow(non_reliable), 0.7 * nrow(non_reliable))
+train_data <- non_reliable[train_idx, ]
+test_data  <- non_reliable[-train_idx, ]
+test_x <- test_data %>% select(-is_above_400_2024)
+test_y <- test_data$is_above_400_2024
+
+
+glm_model_no_reliable <- glm(
+  is_above_400_2024 ~ total_ordered_2023 + numberOfOutlets + 
+    wellPerformingOutlet + customer_age + GeoSpread + 
+    CO2_CUSTOMER + LOCAL_MARKET_PARTNER,
+  data = train_data,
+  family = binomial
+)
+
+predicted_probs <- predict(glm_model_no_reliable, newdata = test_x, type = "response")
+pred_class <- ifelse(predicted_probs >= 0.458, 1, 0)
+
+# Confusion matrix & accuracy
+table(Predicted = pred_class, Actual = test_y)
+mean(pred_class == test_y)
+
+roc_obj <- pROC::roc(response = test_y, predictor = predicted_probs)
+pROC::auc(roc_obj)
+
+```
+
+now AUC is only 91.8 for finding 24 from 2023. with out the high reliable peeps in the mix. 
+
+now just predicting 2025 for this "non reliable" group
+
+```{r}
+# predict 2025 for this segmenet, to see if the removed noise from the super high orders helps us in our understandings 
+
+# 2025 probabilities for non-reliable customers
+non_reliable$predicted_growth_prob_2025 <- predict(glm_model_no_reliable, newdata = non_reliable, type = "response")
+
+# Simulate 2025 threshold crossing
+set.seed(2025)
+non_reliable$is_above_400_2025 <- rbinom(
+  n = nrow(non_reliable),
+  size = 1,
+  prob = non_reliable$predicted_growth_prob_2025
+)
+
+# Prep data for plotting
+non_reliable_summary <- non_reliable |>
+  summarise(
+    Above_400_2024 = mean(is_above_400_2024),
+    Above_400_2025 = mean(is_above_400_2025)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Year", values_to = "Proportion")
+
+# Plot
+ggplot(non_reliable_summary, aes(x = Year, y = Proportion, fill = Year)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 1)), vjust = -0.5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title = "Non-Reliable Customers: % Above 400 Gallons",
+    x = NULL,
+    y = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+table(
+  `2024` = non_reliable$is_above_400_2024,
+  `2025_predicted` = non_reliable$is_above_400_2025
+)
+```
+using a better summary table to find those 57 that crossed over:
+
+```{r}
+
+emerging_retailers <- non_reliable |>
+  filter(is_above_400_2024 == 0 & is_above_400_2025 == 1)
+  
+  emerging_retailers |>
+  arrange(desc(total_ordered_2024)) |>
+  select(Entity_ID, total_ordered_2023, total_ordered_2024, is_above_400_2025, risk_reward_segment,Binning_column)
+  
+  emerging_retailers |>
+    group_by(Binning_column)|>
+    summarise(sum(is_above_400_2025))
+  
+  summary(emerging_retailers)
+  
+  
+non_reliable <- non_reliable |>
+  mutate(pred_2025 = is_above_400_2025) 
+
+# how many predicted to be above 400 in 2025 by segment
+segment_vs_2025 <- non_reliable |>
+  group_by(Binning_column, pred_2025) |>
+  summarise(count = n(), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = pred_2025, values_from = count, values_fill = 0) %>%
+  rename(`Below 400 (Pred)` = `0`, `Above 400 (Pred)` = `1`)
+
+# needed to reset my columns after i changed them, this is the orignal ones we set
+non_reliable|> 
+mutate(Binning_column = case_when(
+    (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY < 0.10 ~ "low volume low growth",
+         (total_ordered_2023 < 400 & total_ordered_2024 < 400) & percentChangeYOY > 0.10 ~ "low volume high growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY < 0.05 ~ "high volume low growth",
+         (total_ordered_2023 > 400 & total_ordered_2024 > 400) & percentChangeYOY > 0.05 ~ "high volume high growth",
+         (total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY > 0 ~ "transtionary growing ",
+         (total_ordered_2023 > 400 | total_ordered_2024 > 400) & percentChangeYOY < 0 ~ "transitionary declining" ))
+
+
+# First, create flags for 2023 and 2024 thresholds if you don't already have them
+non_reliable <- non_reliable %>%
+  mutate(
+    is_above_400_2023 = if_else(total_ordered_2023 >= 400, 1, 0),
+    is_above_400_2024 = if_else(total_ordered_2024 >= 400, 1, 0)  # you might already have this
+  )
+
+# Now summarize counts by Binning group
+summary_counts <- non_reliable %>%
+  group_by(Binning_column) %>%
+  summarise(
+    total_customers = n(),
+    above_400_2023 = sum(is_above_400_2023, na.rm = TRUE),
+    above_400_2024 = sum(is_above_400_2024, na.rm = TRUE),
+    predicted_above_400_2025 = sum(is_above_400_2025, na.rm = TRUE)
+  ) %>%
+  arrange(desc(total_customers))
+
+print(summary_counts)
+
+```
+
+
+
+
